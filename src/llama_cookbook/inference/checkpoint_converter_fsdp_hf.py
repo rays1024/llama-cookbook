@@ -29,32 +29,42 @@ def main(
     consolidated_model_path="",  # Path to save the HF converted model checkpoints
     HF_model_path_or_name="",  # Path/ name of the HF model that include config.json and tokenizer_config.json (e.g. meta-llama/Llama-2-7b-chat-hf)
 ):
+    if HF_model_path_or_name == "":
+        try:
+            file_name = "train_params.yaml"
+            # Combine the directory and file name to create the full path
+            train_params_path = os.path.join(fsdp_checkpoint_path, file_name)
+            # Open the file
+            with open(train_params_path, "r") as file:
+                # Load the YAML data
+                data = yaml.safe_load(file)
 
-    try:
-        file_name = "train_params.yaml"
-        # Combine the directory and file name to create the full path
-        train_params_path = os.path.join(fsdp_checkpoint_path, file_name)
-        # Open the file
-        with open(train_params_path, "r") as file:
-            # Load the YAML data
-            data = yaml.safe_load(file)
+                # Access the 'model_name' field
+                HF_model_path_or_name = data.get("model_name")
 
-            # Access the 'model_name' field
-            HF_model_path_or_name = data.get("model_name")
-
+                print(f"Model name: {HF_model_path_or_name}")
+        except FileNotFoundError:
+            print(f"The file {train_params_path} does not exist.")
+            HF_model_path_or_name = input("Please enter the model name: ")
             print(f"Model name: {HF_model_path_or_name}")
-    except FileNotFoundError:
-        print(f"The file {train_params_path} does not exist.")
-        HF_model_path_or_name = input("Please enter the model name: ")
-        print(f"Model name: {HF_model_path_or_name}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+    else:
+        pass
 
     # load the HF model definition from config
     model_def = load_llama_from_config(HF_model_path_or_name)
     print("model is loaded from config")
+    # extend the model embedding size to match the FSDP sharded model
+    model_def.resize_token_embeddings(130233) # hardcoded for now, if error, change accordingly
+    print("model embedding size is extended to match the FSDP sharded model")
     # load the FSDP sharded checkpoints into the model
-    model = load_sharded_model_single_gpu(model_def, fsdp_checkpoint_path)
+    try:
+        model = load_sharded_model_single_gpu(model_def, fsdp_checkpoint_path)
+    except Exception as e:
+        print(e)
+        print("Change token embedding size accordingly")
+        exit()
     print("model is loaded from FSDP checkpoints")
     # loading the tokenizer form the  model_path
     config = AutoConfig.from_pretrained(HF_model_path_or_name)

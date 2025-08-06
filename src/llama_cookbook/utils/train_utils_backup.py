@@ -24,8 +24,6 @@ from llama_cookbook.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_cookbook.utils.memory_utils import MemoryTrace
 from accelerate.utils import is_xpu_available, is_ccl_available
 from llama_cookbook.utils.flop_utils import FlopMeasure
-import torch.nn as nn
-
 def set_tokenizer_params(tokenizer: LlamaTokenizer):
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
@@ -144,138 +142,14 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             if is_xpu_available():
                                 batch[key] = batch[key].to(torch.device(f"xpu:{local_rank}"))
                             else:
-                                if batch[key] is None:
-                                    continue
                                 batch[key] = batch[key].to(local_rank)
                         else:
                             if is_xpu_available():
                                 batch[key] = batch[key].to('xpu:0')
                             elif torch.cuda.is_available():
-                                if batch[key] is None:
-                                    continue
                                 batch[key] = batch[key].to('cuda:0')
                     with autocast():
-                        if 'input_ids_a' in batch:
-                            outputs_a = model(input_ids=batch["input_ids_a"], attention_mask=batch["attention_mask_a"], labels=batch["labels_a"])
-                            loss_a = outputs_a.loss
-
-                            logits_a = outputs_a.logits.detach().float()
-                            output_a_tokens = logits_a.argmax(dim=-1)
-
-                            # for each entry in the batch, concat context_ids_b, output_a_tokens, prompt_ids_b, and gt_ids_b
-                            input_ids_b = []
-                            attention_mask_b = []
-                            labels_b = []
-                            for i in range(len(batch["context_ids_b"])):
-                                context_ids_b = batch["context_ids_b"][i]
-                                context_ids_b = context_ids_b[context_ids_b != tokenizer.pad_token_id]
-                                output_a_tokens_i = output_a_tokens[i]
-                                output_a_tokens_i = output_a_tokens_i[output_a_tokens_i != tokenizer.pad_token_id]
-                                prompt_ids_b = batch["prompt_ids_b"][i]
-                                prompt_ids_b = prompt_ids_b[prompt_ids_b != tokenizer.pad_token_id]
-                                gt_ids_b = batch["gt_ids_b"][i]
-                                gt_ids_b = gt_ids_b[gt_ids_b != tokenizer.pad_token_id]
-
-                                # concat context + output + prompt + gt + eos
-                                eos_tensor = torch.tensor([tokenizer.eos_token_id], dtype=torch.long).to(context_ids_b.device)
-                                context_token = torch.cat((context_ids_b, output_a_tokens_i, prompt_ids_b), dim=0)
-                                gt_ids_b = torch.cat((gt_ids_b, eos_tensor), dim=0)
-                                input_id = torch.cat((context_token, gt_ids_b), dim=0)
-                                input_ids_b.append(input_id)
-                                attention_mask_b.append(torch.ones_like(input_id))
-                                labels_b.append(torch.cat((torch.full_like(context_token, -100), gt_ids_b), dim=0))
-
-                            input_ids_b = torch.nn.utils.rnn.pad_sequence(input_ids_b, batch_first=True)
-                            attention_mask_b = torch.nn.utils.rnn.pad_sequence(attention_mask_b, batch_first=True)
-                            labels_b = torch.nn.utils.rnn.pad_sequence(labels_b, batch_first=True)
-                            
-                            # move to device
-                            if train_config.enable_fsdp:
-                                if is_xpu_available():
-                                    input_ids_b = input_ids_b.to(torch.device(f"xpu:{local_rank}"))
-                                    attention_mask_b = attention_mask_b.to(torch.device(f"xpu:{local_rank}"))
-                                    labels_b = labels_b.to(torch.device(f"xpu:{local_rank}"))
-                                else:
-                                    input_ids_b = input_ids_b.to(local_rank)
-                                    attention_mask_b = attention_mask_b.to(local_rank)
-                                    labels_b = labels_b.to(local_rank)
-                            else:
-                                if is_xpu_available():
-                                    input_ids_b = input_ids_b.to('xpu:0')
-                                    attention_mask_b = attention_mask_b.to('xpu:0')
-                                    labels_b = labels_b.to('xpu:0')
-                                elif torch.cuda.is_available():
-                                    input_ids_b = input_ids_b.to('cuda:0')
-                                    attention_mask_b = attention_mask_b.to('cuda:0')
-                                    labels_b = labels_b.to('cuda:0')
-
-                            # forward pass and compute
-                            loss_b = model(input_ids=input_ids_b, attention_mask=attention_mask_b, labels=labels_b).loss
-
-                            loss = loss_a + loss_b * train_config.loss_weight
-                        else:
-                            # import torch.nn.functional as F
-
-                            # token_id = tokenizer.convert_tokens_to_ids("EGO_TRAJ_START")
-                            # labels = batch["labels"]
-                            # logits = model(**batch).logits
-                            # mask = (labels == token_id)  # shape: [batch_size, seq_len]
-
-                            # # If the token appears in this batch
-                            # if mask.any():
-                            #     # Get logits only at those positions, and extract the score for EGO_TRAJ_START
-                            #     logits_at_mask = logits[mask]  # shape: [N, vocab_size]
-                            #     logits_for_token = logits_at_mask[:, token_id]  # shape: [N]
-
-                            #     # Also compute softmax probs for those positions
-                            #     logits_at_mask = logits[mask]  # shape: [num_matches, vocab_size]
-                            #     probs = F.softmax(logits_at_mask, dim=-1)[:, token_id]  # shape: [num_matches]
-
-                            #     # Report averages
-                            #     avg_logit = logits_for_token.mean().item()
-                            #     avg_prob = probs.mean().item()
-
-                            #     print(f"[EGO_TRAJ_START] Avg Logit: {avg_logit:.4f}, Avg Prob: {avg_prob:.6f}")
-                            # else:
-                            #     print("EGO_TRAJ_START token not found in batch labels.")
-
-                            # # Get top-3 predictions at each matched position
-                            # topk_probs, topk_indices = torch.topk(F.softmax(logits_at_mask, dim=-1), k=3, dim=-1)
-                            # topk_logits, _ = torch.topk(logits_at_mask, k=3, dim=-1)
-
-                            # # Get token strings
-                            # topk_tokens = tokenizer.convert_ids_to_tokens(topk_indices[0].tolist())  # just show for the first matched position
-
-                            # print("\n[Top 3 predictions at first matched position]:")
-                            # for i in range(3):
-                            #     tok = topk_tokens[i]
-                            #     prob = topk_probs[0, i].item()
-                            #     logit = topk_logits[0, i].item()
-                            #     marker = "<-- YOUR TOKEN" if topk_indices[0, i].item() == token_id else ""
-                            #     print(f"Top-{i+1}: {tok:<20} Logit: {logit:.4f}, Prob: {prob:.6f} {marker}")
-
-                            # exit()
-
-                            if 'identifier' in batch:
-                                loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-                                logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
-                                targets = batch["labels"]
-                                mask = (targets != -100).float()
-                                task_type = batch["identifier"] # [batch_size, seq_len]
-                                per_token_loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
-                                per_sample_loss = per_token_loss.view(logits.size(0), -1)
-                                sum_loss_per_sample = (per_sample_loss * mask).sum(dim=1)
-                                count_per_sample = mask.sum(dim=1).clamp(min=1)
-                                mean_loss_per_sample = sum_loss_per_sample / count_per_sample
-                                task_type_sum = task_type.sum(dim=1) # [batch_size]
-                                weights = torch.where(task_type_sum > 0, train_config.loss_weight, 1.0) # 0 is qa and 1 is traj
-                                weighted_per_sample = mean_loss_per_sample * weights.squeeze(-1)
-                                loss = weighted_per_sample.sum() / len(weighted_per_sample)
-                                # get individual loss for each task type
-                                loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
-                                loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
-                            else:
-                                loss = model(**batch).loss
+                        loss = model(**batch).loss
                     total_loss += loss.detach().float()
                     loss = loss / gradient_accumulation_steps
                     if train_config.save_metrics:
@@ -317,11 +191,6 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 'train/epoch': epoch + 1,
                                 'train/step': epoch * len(train_dataloader) + step,
                                 'train/loss': loss.detach().float(),
-                            })
-                        if "identifier" in batch:
-                            wandb_run.log({
-                                'train/loss_qa': loss_qa.detach().float(),
-                                'train/loss_traj': loss_traj.detach().float(),
                             })
 
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
@@ -489,110 +358,27 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                 break
             for key in batch.keys():
                 if train_config.enable_fsdp:
-                    if batch[key] is None:
-                        continue
                     batch[key] = batch[key].to(local_rank)
                 else:
                     if is_xpu_available():
                         batch[key] = batch[key].to('xpu:0')
                     else:
-                        if batch[key] is None:
-                            continue
                         batch[key] = batch[key].to('cuda:0')
             # Ensure no gradients are computed for this scope to save memory
             with torch.no_grad():
                 # Forward pass and compute loss
-                if 'input_ids_a' in batch:
-                    outputs_a = model(input_ids=batch["input_ids_a"], attention_mask=batch["attention_mask_a"], labels=batch["labels_a"])
-                    loss_a = outputs_a.loss
-
-                    logits_a = outputs_a.logits.detach().float()
-                    output_a_tokens = logits_a.argmax(dim=-1)
-
-                    # for each entry in the batch, concat context_ids_b, output_a_tokens, prompt_ids_b, and gt_ids_b
-                    input_ids_b = []
-                    attention_mask_b = []
-                    labels_b = []
-                    for i in range(len(batch["context_ids_b"])):
-                        context_ids_b = batch["context_ids_b"][i]
-                        context_ids_b = context_ids_b[context_ids_b != tokenizer.pad_token_id]
-                        output_a_tokens_i = output_a_tokens[i]
-                        output_a_tokens_i = output_a_tokens_i[output_a_tokens_i != tokenizer.pad_token_id]
-                        prompt_ids_b = batch["prompt_ids_b"][i]
-                        prompt_ids_b = prompt_ids_b[prompt_ids_b != tokenizer.pad_token_id]
-                        gt_ids_b = batch["gt_ids_b"][i]
-                        gt_ids_b = gt_ids_b[gt_ids_b != tokenizer.pad_token_id]
-
-                        # concat context + output + prompt + eos
-                        eos_tensor = torch.tensor([tokenizer.eos_token_id], dtype=torch.long).to(context_ids_b.device)
-                        context_token = torch.cat((context_ids_b, output_a_tokens_i, prompt_ids_b), dim=0)
-                        gt_ids_b = torch.cat((gt_ids_b, eos_tensor), dim=0)
-                        input_id = torch.cat((context_token, gt_ids_b), dim=0)
-                        input_ids_b.append(input_id)
-                        attention_mask_b.append(torch.ones_like(input_id))
-                        labels_b.append(torch.cat((torch.full_like(context_token, -100), gt_ids_b), dim=0))
-
-                    input_ids_b = torch.nn.utils.rnn.pad_sequence(input_ids_b, batch_first=True)
-                    attention_mask_b = torch.nn.utils.rnn.pad_sequence(attention_mask_b, batch_first=True)
-                    labels_b = torch.nn.utils.rnn.pad_sequence(labels_b, batch_first=True)
-                    
-                    # move to device
-                    if train_config.enable_fsdp:
-                        if is_xpu_available():
-                            input_ids_b = input_ids_b.to(torch.device(f"xpu:{local_rank}"))
-                            attention_mask_b = attention_mask_b.to(torch.device(f"xpu:{local_rank}"))
-                            labels_b = labels_b.to(torch.device(f"xpu:{local_rank}"))
-                        else:
-                            input_ids_b = input_ids_b.to(local_rank)
-                            attention_mask_b = attention_mask_b.to(local_rank)
-                            labels_b = labels_b.to(local_rank)
-                    else:
-                        if is_xpu_available():
-                            input_ids_b = input_ids_b.to('xpu:0')
-                            attention_mask_b = attention_mask_b.to('xpu:0')
-                            labels_b = labels_b.to('xpu:0')
-                        elif torch.cuda.is_available():
-                            input_ids_b = input_ids_b.to('cuda:0')
-                            attention_mask_b = attention_mask_b.to('cuda:0')
-                            labels_b = labels_b.to('cuda:0')
-
-                    # forward pass and compute
-                    loss_b = model(input_ids=input_ids_b, attention_mask=attention_mask_b, labels=labels_b).loss
-
-                    loss = loss_a + loss_b * train_config.loss_weight
-                else:
-                    if "identifier" in batch:
-                        loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-                        logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
-                        targets = batch["labels"]
-                        mask = (targets != -100).float()
-                        task_type = batch["identifier"]
-                        per_token_loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
-                        per_sample_loss = per_token_loss.view(logits.size(0), -1)
-                        sum_loss_per_sample = (per_sample_loss * mask).sum(dim=1)
-                        count_per_sample = mask.sum(dim=1).clamp(min=1)
-                        mean_loss_per_sample = sum_loss_per_sample / count_per_sample
-                        task_type_sum = task_type.sum(dim=1) # [batch_size]
-                        weights = torch.where(task_type_sum > 0, train_config.loss_weight, 1.0) # 0 is qa and 1 is traj
-                        weighted_per_sample = mean_loss_per_sample * weights.squeeze(-1)
-                        loss = weighted_per_sample.sum() / len(weighted_per_sample)
-                        # get individual loss for each task type
-                        loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
-                        loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
-                    else:
-                        loss = model(**batch).loss
-            
+                outputs = model(**batch)
+                loss = outputs.loss
                 if train_config.save_metrics:
                     val_step_loss.append(loss.detach().float().item())
                     val_step_perplexity.append(float(torch.exp(loss.detach().float())))
 
                 eval_loss += loss.detach().float()
-
-            # # Decode predictions and add to evaluation predictions list
-            # preds = torch.argmax(outputs.logits, -1)
-            # eval_preds.extend(
-            #     tokenizer.batch_decode(preds.detach().cpu().numpy(), skip_special_tokens=True)
-            # )
+            # Decode predictions and add to evaluation predictions list
+            preds = torch.argmax(outputs.logits, -1)
+            eval_preds.extend(
+                tokenizer.batch_decode(preds.detach().cpu().numpy(), skip_special_tokens=True)
+            )
 
     # If there's more than one CUDA device, reduce evaluation loss across all devices
     if is_xpu_available() and (torch.xpu.device_count() > 1 and train_config.enable_fsdp):
@@ -618,11 +404,6 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         'eval/perplexity': eval_ppl,
                         'eval/loss': eval_epoch_loss,
                     }, commit=False)
-        if "identifier" in batch:
-            wandb_run.log({
-                'eval/loss_qa': loss_qa.detach().float(),
-                'eval/loss_traj': loss_traj.detach().float(),
-            }, commit=False)
 
     return eval_ppl, eval_epoch_loss, val_step_loss, val_step_perplexity
 

@@ -19,6 +19,8 @@ class ConcatDataset(Dataset):
             "attention_mask": [],
             "labels": [],
             }
+        
+        buffer = {k: [] for k in next(iter(self.dataset))}
 
         for sample in tqdm(self.dataset, desc="Preprocessing dataset", dynamic_ncols=True):
             buffer = {k: v + sample[k] for k,v in buffer.items()}

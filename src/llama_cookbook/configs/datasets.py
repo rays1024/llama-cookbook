@@ -23,18 +23,25 @@ class alpaca_dataset:
     dataset: str = "alpaca_dataset"
     train_split: str = "train"
     test_split: str = "val"
-    data_path: str = "src/llama_cookbook/datasets/alpaca_data.json"
+    data_path: str = "/p/liverobotics/Rui/llama-cookbook/src/llama_cookbook/datasets/alpaca_data.json"
 
 @dataclass
 class custom_dataset:
     dataset: str = "custom_dataset"
-    file: str = "getting-started/finetuning/datasets/custom_dataset.py"
-    train_split: str = "train"
+    file: str = "/p/liverobotics/Rui/llama-cookbook/getting-started/finetuning/datasets/custom_dataset.py"
+    train_split: str = "training"
     test_split: str = "validation"
-    data_path: str = ""
-
+    data_path: str = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_sampling_factor_2.parquet"
+    
 @dataclass
 class llamaguard_toxicchat_dataset:
     dataset: str = "llamaguard_toxicchat_dataset"
     train_split: str = "train"
     test_split: str = "test"
+
+@dataclass 
+class ocrvqa_dataset:
+    dataset: str = "ocrvqa_dataset"
+    train_split: str = "train"
+    test_split: str = "validation"
+    data_path: str = "/p/liverobotics/Rui/llama-cookbook/getting-started/finetuning/datasets/ocrvqa_dataset.py"

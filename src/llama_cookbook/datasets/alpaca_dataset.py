@@ -27,11 +27,11 @@ class InstructionDataset(Dataset):
     def __init__(self, dataset_config, tokenizer, partition="train"):
         self.ann = json.load(open(dataset_config.data_path))
         # Use 5% of the dataset for evaluation
-        eval_length = int(len(self.ann)/20)
-        if partition == "train":
-            self.ann = self.ann[eval_length:]
-        else:
-            self.ann = self.ann[:eval_length]
+        # eval_length = int(len(self.ann)/20)
+        # if partition == "train":
+        #     self.ann = self.ann[eval_length:]
+        # else:
+        #     self.ann = self.ann[:eval_length]
 
         self.tokenizer = tokenizer
 

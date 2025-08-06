@@ -161,18 +161,23 @@ def main(**kwargs):
         model.language_model.supports_gradient_checkpointing = True
     elif config.model_type == "llama":
         is_vision = False
-        model = LlamaForCausalLM.from_pretrained(
-            train_config.model_name,
-            quantization_config=bnb_config,
-            use_cache=use_cache,
-            attn_implementation="sdpa" if train_config.use_fast_kernels else None,
-            device_map=(
-                "auto"
-                if train_config.quantization and not train_config.enable_fsdp
-                else None
-            ),
-            torch_dtype=torch.float16 if train_config.use_fp16 else "auto",
-        )
+        if getattr(train_config, "untrained", False):
+            # Load an untrained (randomly initialized) Llama model
+            model = LlamaForCausalLM(config)
+        else:
+            model = LlamaForCausalLM.from_pretrained(
+                train_config.model_name,
+                quantization_config=bnb_config,
+                use_cache=use_cache,
+                attn_implementation="sdpa" if train_config.use_fast_kernels else None,
+                device_map=(
+                    "auto"
+                    if train_config.quantization and not train_config.enable_fsdp
+                    else None
+                ),
+                torch_dtype=torch.float16 if train_config.use_fp16 else "auto",
+            )
+        
     else:
         raise ValueError(
             f"Model type {config.model_type} is not supported. Please use llama or mllama model."
@@ -185,6 +190,106 @@ def main(**kwargs):
     )
     if not tokenizer.pad_token_id:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    ROAD_TYPE_TOKEN = [
+        "LaneCenter-Freeway",
+        "LaneCenter-SurfaceStreet",
+        "RoadLine-BrokenSingleWhite",
+        "RoadLine-SolidSingleWhite",
+        "RoadLine-SolidDoubleWhite",
+        "RoadLine-BrokenSingleYellow",
+        "RoadLine-BrokenDoubleYellow",
+        "Roadline-SolidSingleYellow",
+        "Roadline-SolidDoubleYellow",
+        "RoadLine-PassingDoubleYellow",
+        "StopSign",
+        "Crosswalk",
+        "SpeedBump"
+    ]
+    
+    # ROAD_TYPE_TOKEN = [
+    #     "LaneCenter-Freeway",
+    #     "LaneCenter-SurfaceStreet",
+    #     "LaneCenter-BikeLane",
+    #     "RoadLine-BrokenSingleWhite",
+    #     "RoadLine-SolidSingleWhite",
+    #     "RoadLine-SolidDoubleWhite",
+    #     "RoadLine-BrokenSingleYellow",
+    #     "RoadLine-BrokenDoubleYellow",
+    #     "Roadline-SolidSingleYellow",
+    #     "Roadline-SolidDoubleYellow",
+    #     "RoadLine-PassingDoubleYellow",
+    #     "RoadEdgeBoundary",
+    #     "RoadEdgeMedian",
+    #     "StopSign",
+    #     "Crosswalk",
+    #     "SpeedBump"
+    # ]
+
+    # vel_type = [f'VEL_{round(i/10, 2)}' for i in list(range(0, 41))]
+    acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
+    len_type = [f'LEN_{round(i/10, 2)}' for i in list(range(0, 51, 5))]
+    dir_type = [f'VEC_{i}' for i in range(360)]
+
+    veh_vec = [f'VEH_VEC_{i}' for i in range(512)]
+    ped_vec = [f'PED_VEC_{i}' for i in range(512)]
+    cyc_vec = [f'CYCL_VEC_{i}' for i in range(512)]
+
+    custom_tokens = []
+
+    # custom_tokens.extend(vel_type)
+    custom_tokens.extend(acc_type)
+    custom_tokens.extend(len_type)
+    custom_tokens.extend(dir_type)
+
+    custom_tokens.extend(veh_vec)
+    custom_tokens.extend(ped_vec)
+    custom_tokens.extend(cyc_vec)
+
+    # for l in len_type:
+    #     for d in dir_type:
+    #         custom_tokens.append(f'{d}{l}')
+
+    # for v in vel_type:
+    #     for d in dir_type:
+    #         custom_tokens.append(f'{d}{v}')
+
+    # for a in acc_type:
+    #     for d in dir_type:
+    #         custom_tokens.append(f'{d}{a}')
+
+    custom_tokens.extend(ROAD_TYPE_TOKEN)
+
+    # custom_tokens.append('<ROAD_START>')
+    # custom_tokens.append('<ROAD_END>')
+    # custom_tokens.append('<ROAD_VECTOR_START>')
+    # custom_tokens.append('<ROAD_VECTOR_END>')
+    # custom_tokens.append('AGENT_TRAJ_START')
+    # custom_tokens.append('AGENT_TRAJ_END')
+    custom_tokens.append('START_')
+    custom_tokens.append('AGENT_ID_')
+    custom_tokens.append('AGENT_TYPE_Vehicle')
+    custom_tokens.append('AGENT_TYPE_Pedestrian')
+    custom_tokens.append('AGENT_TYPE_Cyclist')
+    custom_tokens.append('AGENT_TYPE_Other')
+    custom_tokens.append('AGENT_TYPE_Unset')
+    custom_tokens.append('TRAJ_NONE')
+    custom_tokens.append('CTRL_NONE')
+    custom_tokens.append('EGO_TRAJ_START')
+    custom_tokens.append('EGO_TRAJ_END')
+    custom_tokens.append('AGENT_TRAJ_START')
+    custom_tokens.append('AGENT_TRAJ_END')
+    custom_tokens.append('MAP_START')
+    custom_tokens.append('MAP_END')
+    custom_tokens.append('INITIAL_HEADING_')
+
+    tokenizer.add_tokens(custom_tokens)
+
+
+
+    # for heirarchical ft onlt
+    # tokenizer.model_input_names = ['input_ids_a', 'labels_a', 'attention_mask_a', 'context_ids_b', 'gt_ids_b', 'prompt_ids_b']
+    tokenizer.model_input_names = ['input_ids', 'labels', 'attention_mask', 'identifier']
 
     # If there is a mismatch between tokenizer vocab size and embedding matrix,
     # throw a warning and then expand the embedding matrix
