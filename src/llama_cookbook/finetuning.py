@@ -226,25 +226,25 @@ def main(**kwargs):
     #     "SpeedBump"
     # ]
 
-    # vel_type = [f'VEL_{round(i/10, 2)}' for i in list(range(0, 41))]
-    acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
-    len_type = [f'LEN_{round(i/10, 2)}' for i in list(range(0, 51, 5))]
-    dir_type = [f'VEC_{i}' for i in range(360)]
+    # # vel_type = [f'VEL_{round(i/10, 2)}' for i in list(range(0, 41))]
+    # acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
+    # len_type = [f'LEN_{round(i/10, 2)}' for i in list(range(0, 51, 5))]
+    # dir_type = [f'VEC_{i}' for i in range(360)]
 
-    veh_vec = [f'VEH_VEC_{i}' for i in range(512)]
-    ped_vec = [f'PED_VEC_{i}' for i in range(512)]
-    cyc_vec = [f'CYCL_VEC_{i}' for i in range(512)]
+    # veh_vec = [f'VEH_VEC_{i}' for i in range(512)]
+    # ped_vec = [f'PED_VEC_{i}' for i in range(512)]
+    # cyc_vec = [f'CYCL_VEC_{i}' for i in range(512)]
 
-    custom_tokens = []
+    # custom_tokens = []
 
-    # custom_tokens.extend(vel_type)
-    custom_tokens.extend(acc_type)
-    custom_tokens.extend(len_type)
-    custom_tokens.extend(dir_type)
+    # # custom_tokens.extend(vel_type)
+    # custom_tokens.extend(acc_type)
+    # custom_tokens.extend(len_type)
+    # custom_tokens.extend(dir_type)
 
-    custom_tokens.extend(veh_vec)
-    custom_tokens.extend(ped_vec)
-    custom_tokens.extend(cyc_vec)
+    # custom_tokens.extend(veh_vec)
+    # custom_tokens.extend(ped_vec)
+    # custom_tokens.extend(cyc_vec)
 
     # for l in len_type:
     #     for d in dir_type:
@@ -258,7 +258,38 @@ def main(**kwargs):
     #     for d in dir_type:
     #         custom_tokens.append(f'{d}{a}')
 
+
+    angle_bins = np.load('/p/ruishen/processed_waymo_data/validation/waymo_vectorized/combined_angle_bins_10hz_512.npy', allow_pickle=True)
+    len_vals = np.arange(0, 3.51, 0.01)
+    len_type = [f"LEN_{val:.2f}" for val in len_vals]
+    len_type.append("LEN_10.00")
+    dir_type = [f"VEC_{i}" for i in range(len(angle_bins))]
+    acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
+
+    custom_tokens = []
+    custom_tokens.extend(acc_type)
+    custom_tokens.extend(len_type)
+    custom_tokens.extend(dir_type)
+    
+
     custom_tokens.extend(ROAD_TYPE_TOKEN)
+
+    # custom_tokens.append('START_')
+    # custom_tokens.append('AGENT_ID_')
+    # custom_tokens.append('AGENT_TYPE_Vehicle')
+    # custom_tokens.append('AGENT_TYPE_Pedestrian')
+    # custom_tokens.append('AGENT_TYPE_Cyclist')
+    # custom_tokens.append('AGENT_TYPE_Other')
+    # custom_tokens.append('AGENT_TYPE_Unset')
+    # custom_tokens.append('TRAJ_NONE')
+    # custom_tokens.append('CTRL_NONE')
+    # custom_tokens.append('EGO_TRAJ_START')
+    # custom_tokens.append('EGO_TRAJ_END')
+    # custom_tokens.append('AGENT_TRAJ_START')
+    # custom_tokens.append('AGENT_TRAJ_END')
+    # custom_tokens.append('MAP_START')
+    # custom_tokens.append('MAP_END')
+    # custom_tokens.append('INITIAL_HEADING_')
 
     # custom_tokens.append('<ROAD_START>')
     # custom_tokens.append('<ROAD_END>')
@@ -266,6 +297,7 @@ def main(**kwargs):
     # custom_tokens.append('<ROAD_VECTOR_END>')
     # custom_tokens.append('AGENT_TRAJ_START')
     # custom_tokens.append('AGENT_TRAJ_END')
+
     custom_tokens.append('START_')
     custom_tokens.append('AGENT_ID_')
     custom_tokens.append('AGENT_TYPE_Vehicle')
@@ -275,6 +307,8 @@ def main(**kwargs):
     custom_tokens.append('AGENT_TYPE_Unset')
     custom_tokens.append('TRAJ_NONE')
     custom_tokens.append('CTRL_NONE')
+    custom_tokens.append('POS_')
+    custom_tokens.append('POS_NONE')
     custom_tokens.append('EGO_TRAJ_START')
     custom_tokens.append('EGO_TRAJ_END')
     custom_tokens.append('AGENT_TRAJ_START')

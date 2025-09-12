@@ -22,6 +22,7 @@ import json
 from llama_cookbook.model_checkpointing import save_fsdp_model_checkpoint_full, save_model_and_optimizer_sharded, save_optimizer_checkpoint, save_peft_checkpoint, save_model_checkpoint
 from llama_cookbook.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_cookbook.utils.memory_utils import MemoryTrace
+from llama_cookbook.utils.aux_loss import ade_loss
 from accelerate.utils import is_xpu_available, is_ccl_available
 from llama_cookbook.utils.flop_utils import FlopMeasure
 import torch.nn as nn
@@ -132,6 +133,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch+1}", total=total_length, dynamic_ncols=True)
             with profile(train_config,local_rank) as profile_context:
                 for step, batch in enumerate(train_dataloader):
+                    sid = batch.pop("sid", None)
+                    ego_id = batch.pop("ego_id", None)
                     total_train_steps += 1
                     # stop when the maximum number of training steps is reached
                     if train_config.max_train_step > 0 and total_train_steps > train_config.max_train_step:
@@ -214,48 +217,6 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
                             loss = loss_a + loss_b * train_config.loss_weight
                         else:
-                            # import torch.nn.functional as F
-
-                            # token_id = tokenizer.convert_tokens_to_ids("EGO_TRAJ_START")
-                            # labels = batch["labels"]
-                            # logits = model(**batch).logits
-                            # mask = (labels == token_id)  # shape: [batch_size, seq_len]
-
-                            # # If the token appears in this batch
-                            # if mask.any():
-                            #     # Get logits only at those positions, and extract the score for EGO_TRAJ_START
-                            #     logits_at_mask = logits[mask]  # shape: [N, vocab_size]
-                            #     logits_for_token = logits_at_mask[:, token_id]  # shape: [N]
-
-                            #     # Also compute softmax probs for those positions
-                            #     logits_at_mask = logits[mask]  # shape: [num_matches, vocab_size]
-                            #     probs = F.softmax(logits_at_mask, dim=-1)[:, token_id]  # shape: [num_matches]
-
-                            #     # Report averages
-                            #     avg_logit = logits_for_token.mean().item()
-                            #     avg_prob = probs.mean().item()
-
-                            #     print(f"[EGO_TRAJ_START] Avg Logit: {avg_logit:.4f}, Avg Prob: {avg_prob:.6f}")
-                            # else:
-                            #     print("EGO_TRAJ_START token not found in batch labels.")
-
-                            # # Get top-3 predictions at each matched position
-                            # topk_probs, topk_indices = torch.topk(F.softmax(logits_at_mask, dim=-1), k=3, dim=-1)
-                            # topk_logits, _ = torch.topk(logits_at_mask, k=3, dim=-1)
-
-                            # # Get token strings
-                            # topk_tokens = tokenizer.convert_ids_to_tokens(topk_indices[0].tolist())  # just show for the first matched position
-
-                            # print("\n[Top 3 predictions at first matched position]:")
-                            # for i in range(3):
-                            #     tok = topk_tokens[i]
-                            #     prob = topk_probs[0, i].item()
-                            #     logit = topk_logits[0, i].item()
-                            #     marker = "<-- YOUR TOKEN" if topk_indices[0, i].item() == token_id else ""
-                            #     print(f"Top-{i+1}: {tok:<20} Logit: {logit:.4f}, Prob: {prob:.6f} {marker}")
-
-                            # exit()
-
                             if 'identifier' in batch:
                                 loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
                                 logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
@@ -275,7 +236,55 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                                 loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                             else:
-                                loss = model(**batch).loss
+                                # loss = model(**batch).loss
+
+                                # CE loss and ade loss
+                                # outputs = model(**batch)
+                                # main_loss = outputs.loss
+                                # labels = batch["labels"]
+                                # task_mask = (labels == 129324).any(dim=1)  # Check if any label is EGO_TRAJ_START
+                                # if task_mask.any():
+                                #     special_inputs = {k: v[task_mask] for k, v in batch.items()}
+                                #     sid = [s for s, keep in zip(sid, task_mask) if keep]
+                                #     ego_id = [e for e, keep in zip(ego_id, task_mask) if keep]
+                                #     logits_all = outputs.logits
+                                #     logits_sp = logits_all[task_mask]
+                                #     generated_texts = logits_sp.argmax(dim=-1)
+                                #     generated_texts = tokenizer.batch_decode(generated_texts, skip_special_tokens=True)
+                                #     ct = special_inputs.get("input_ids", None)
+                                #     ct = tokenizer.batch_decode(ct, skip_special_tokens=True)
+                                #     ade, aux_loss, default_ade = ade_loss(generated_texts, sid, ego_id, context=ct)
+
+                                #     loss = (main_loss + aux_loss) / 2
+                                # else:
+                                #     loss = main_loss
+
+                                # ade loss only
+                                outputs = model(**batch)
+                                logits = outputs.logits
+                                labels = batch["labels"]
+                                aux_loss, ade, _ = ade_loss(logits, top_k=5, sid=sid, ego_id=ego_id, weight=1.0, tokenizer=tokenizer, labels=labels)
+                                ce = outputs.loss
+                                aux_weight = 0.2 + 0.6 * min(epoch / train_config.num_epochs, 1.0)
+                                loss = (1-aux_weight) * ce + aux_weight * aux_loss
+
+                                if step % 200 == 0:
+                                    folder_name = (
+                                            train_config.dist_checkpoint_root_folder
+                                            + "/"
+                                            + train_config.dist_checkpoint_folder
+                                            + "-"
+                                            + train_config.model_name
+                                        )
+                                    if not os.path.exists(f"{folder_name}/logs"):
+                                        os.makedirs(f"{folder_name}/logs", exist_ok=True)
+                                    torch.save({
+                                        "epoch": epoch,
+                                        "step": step,
+                                        "logits": logits.detach().cpu(),
+                                        "labels": labels.detach().cpu(),
+                                    }, f"{folder_name}/logs/logits_labels_rank{local_rank}_epoch{epoch}_step{step}.pt")
+
                     total_loss += loss.detach().float()
                     loss = loss / gradient_accumulation_steps
                     if train_config.save_metrics:
@@ -323,6 +332,12 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 'train/loss_qa': loss_qa.detach().float(),
                                 'train/loss_traj': loss_traj.detach().float(),
                             })
+                        if "ce" in locals() and "ade" in locals():
+                            wandb_run.log({
+                                'train/aux_loss': aux_loss,
+                                'train/ce': ce,
+                                'train/ade': ade,
+                            })
 
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
 
@@ -358,6 +373,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 val_step_perplexity.extend(temp_step_perplexity)
             should_save_model = train_config.save_model and eval_epoch_loss < best_val_loss
         
+        should_save_model = True
         checkpoint_start_time = time.perf_counter()
         if should_save_model:
             if train_config.enable_fsdp:
@@ -406,7 +422,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     else:
                         print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
                         print("=====================================================")
-                        save_model_and_optimizer_sharded(model, rank, train_config)
+                        save_model_and_optimizer_sharded(model, rank, train_config, epoch=epoch)
 
                     
             if train_config.enable_fsdp:
@@ -481,6 +497,8 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
     total_eval_steps = 0
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
+            sid = batch.pop("sid", None)
+            ego_id = batch.pop("ego_id", None)
             total_eval_steps += 1
             # stop when the maximum number of eval steps is reached
             if train_config.max_eval_step > 0 and total_eval_steps > train_config.max_eval_step:
@@ -580,7 +598,36 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                         loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                     else:
-                        loss = model(**batch).loss
+                        # loss = model(**batch).loss
+
+                        # CE loss and ade loss
+                        # outputs = model(**batch)
+                        # main_loss = outputs.loss
+                        # labels = batch["labels"]
+                        # task_mask = (labels == 129324).any(dim=1)  # Check if any label is EGO_TRAJ_START
+                        # if task_mask.any():
+                        #     special_inputs = {k: v[task_mask] for k, v in batch.items()}
+                        #     sid = [s for s, keep in zip(sid, task_mask) if keep]
+                        #     ego_id = [e for e, keep in zip(ego_id, task_mask) if keep]
+                        #     logits_all = outputs.logits
+                        #     logits_sp = logits_all[task_mask]
+                        #     generated_texts = logits_sp.argmax(dim=-1)
+                        #     generated_texts = tokenizer.batch_decode(generated_texts, skip_special_tokens=True)
+                        #     ct = special_inputs.get("input_ids", None)
+                        #     ct = tokenizer.batch_decode(ct, skip_special_tokens=True)
+                        #     ade, aux_loss, default_ade = ade_loss(generated_texts, sid, ego_id, context=ct)
+
+                        #     loss = (main_loss + aux_loss) / 2
+                        # else:
+                        #     loss = main_loss
+
+                        # ade loss only
+                        outputs = model(**batch)
+                        logits = outputs.logits
+                        labels = batch["labels"]
+                        aux_loss, ade, ce = ade_loss(logits, top_k=1, sid=sid, ego_id=ego_id, weight=1.0, tokenizer=tokenizer, labels=labels)
+                        ce = outputs.loss
+                        loss = (aux_loss + ce) / 2
             
                 if train_config.save_metrics:
                     val_step_loss.append(loss.detach().float().item())
@@ -622,6 +669,12 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
             wandb_run.log({
                 'eval/loss_qa': loss_qa.detach().float(),
                 'eval/loss_traj': loss_traj.detach().float(),
+            }, commit=False)
+        if "ce" in locals() and "ade" in locals():
+            wandb_run.log({
+                'eval/aux_loss': aux_loss,
+                'eval/ce': ce,
+                'eval/ade': ade,
             }, commit=False)
 
     return eval_ppl, eval_epoch_loss, val_step_loss, val_step_perplexity

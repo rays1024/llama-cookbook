@@ -11,6 +11,8 @@ import fire
 
 import torch
 
+import numpy as np
+
 from accelerate.utils import is_xpu_available
 from llama_cookbook.inference.model_utils import load_model, load_peft_model
 
@@ -98,14 +100,14 @@ def main(
     model_name,
     peft_model: str = None,
     quantization: str = None, # Options: 4bit, 8bit
-    max_new_tokens: int = 100,  # The maximum numbers of tokens to generate
+    max_new_tokens: int = 1000,  # The maximum numbers of tokens to generate
     prompt_file: str = None,
     seed: int = 42,  # seed value for reproducibility
     do_sample: bool = True,  # Whether or not to use sampling ; use greedy decoding otherwise.
     min_length: int = None,  # The minimum length of the sequence to be generated, input prompt + min_new_tokens
     use_cache: bool = True,  # [optional] Whether or not the model should use the past last key/values attentions Whether or not the model should use the past last key/values attentions (if applicable to the model) to speed up decoding.
     top_p: float = 0.9,  # [optional] If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to top_p or higher are kept for generation.
-    temperature: float = 0.3,  # [optional] The value used to modulate the next token probabilities.
+    temperature: float = 1.0,  # [optional] The value used to modulate the next token probabilities.
     top_k: int = 50,  # [optional] The number of highest probability vocabulary tokens to keep for top-k-filtering.
     repetition_penalty: float = 1.0,  # The parameter for repetition penalty. 1.0 means no penalty.
     length_penalty: int = 1,  # [optional] Exponential penalty to the length that is used with beam-based generation.
@@ -163,25 +165,25 @@ def main(
     #     "SpeedBump"
     # ]
 
-    # vel_type = [f'VEL_{round(i/10, 2)}' for i in list(range(0, 41))]
-    acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
-    len_type = [f'LEN_{round(i/10, 2)}' for i in list(range(0, 51, 5))]
-    dir_type = [f'VEC_{i}' for i in range(360)]
+    # # vel_type = [f'VEL_{round(i/10, 2)}' for i in list(range(0, 41))]
+    # acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
+    # len_type = [f'LEN_{round(i/10, 2)}' for i in list(range(0, 51, 5))]
+    # dir_type = [f'VEC_{i}' for i in range(360)]
 
-    veh_vec = [f'VEH_VEC_{i}' for i in range(512)]
-    ped_vec = [f'PED_VEC_{i}' for i in range(512)]
-    cyc_vec = [f'CYCL_VEC_{i}' for i in range(512)]
+    # veh_vec = [f'VEH_VEC_{i}' for i in range(512)]
+    # ped_vec = [f'PED_VEC_{i}' for i in range(512)]
+    # cyc_vec = [f'CYCL_VEC_{i}' for i in range(512)]
 
-    custom_tokens = []
+    # custom_tokens = []
 
-    # custom_tokens.extend(vel_type)
-    custom_tokens.extend(acc_type)
-    custom_tokens.extend(len_type)
-    custom_tokens.extend(dir_type)
+    # # custom_tokens.extend(vel_type)
+    # custom_tokens.extend(acc_type)
+    # custom_tokens.extend(len_type)
+    # custom_tokens.extend(dir_type)
 
-    custom_tokens.extend(veh_vec)
-    custom_tokens.extend(ped_vec)
-    custom_tokens.extend(cyc_vec)
+    # custom_tokens.extend(veh_vec)
+    # custom_tokens.extend(ped_vec)
+    # custom_tokens.extend(cyc_vec)
 
     # for l in len_type:
     #     for d in dir_type:
@@ -195,6 +197,19 @@ def main(
     #     for d in dir_type:
     #         custom_tokens.append(f'{d}{a}')
 
+
+    angle_bins = np.load('/p/ruishen/processed_waymo_data/validation/waymo_vectorized/combined_angle_bins_10hz_512.npy', allow_pickle=True)
+    len_vals = np.arange(0, 3.51, 0.01)
+    len_type = [f"LEN_{val:.2f}" for val in len_vals]
+    len_type.append("LEN_10.00")
+    dir_type = [f"VEC_{i}" for i in range(len(angle_bins))]
+    acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
+
+    custom_tokens = []
+    custom_tokens.extend(acc_type)
+    custom_tokens.extend(len_type)
+    custom_tokens.extend(dir_type)
+
     custom_tokens.extend(ROAD_TYPE_TOKEN)
 
     # custom_tokens.append('<ROAD_START>')
@@ -203,6 +218,23 @@ def main(
     # custom_tokens.append('<ROAD_VECTOR_END>')
     # custom_tokens.append('AGENT_TRAJ_START')
     # custom_tokens.append('AGENT_TRAJ_END')
+    # custom_tokens.append('START_')
+    # custom_tokens.append('AGENT_ID_')
+    # custom_tokens.append('AGENT_TYPE_Vehicle')
+    # custom_tokens.append('AGENT_TYPE_Pedestrian')
+    # custom_tokens.append('AGENT_TYPE_Cyclist')
+    # custom_tokens.append('AGENT_TYPE_Other')
+    # custom_tokens.append('AGENT_TYPE_Unset')
+    # custom_tokens.append('TRAJ_NONE')
+    # custom_tokens.append('CTRL_NONE')
+    # custom_tokens.append('EGO_TRAJ_START')
+    # custom_tokens.append('EGO_TRAJ_END')
+    # custom_tokens.append('AGENT_TRAJ_START')
+    # custom_tokens.append('AGENT_TRAJ_END')
+    # custom_tokens.append('MAP_START')
+    # custom_tokens.append('MAP_END')
+    # custom_tokens.append('INITIAL_HEADING_')
+
     custom_tokens.append('START_')
     custom_tokens.append('AGENT_ID_')
     custom_tokens.append('AGENT_TYPE_Vehicle')
@@ -212,6 +244,8 @@ def main(
     custom_tokens.append('AGENT_TYPE_Unset')
     custom_tokens.append('TRAJ_NONE')
     custom_tokens.append('CTRL_NONE')
+    custom_tokens.append('POS_')
+    custom_tokens.append('POS_NONE')
     custom_tokens.append('EGO_TRAJ_START')
     custom_tokens.append('EGO_TRAJ_END')
     custom_tokens.append('AGENT_TRAJ_START')
@@ -281,6 +315,8 @@ def main(
                 # output_attentions=True,
                 # output_scores=True,
                 return_dict_in_generate=True,
+                eos_token_id=None,
+                pad_token_id=tokenizer.eos_token_id,
                 **kwargs,
             )
 
@@ -393,13 +429,23 @@ def main(
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/hierarchical_reasoning_validation.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_long.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_long_predefined.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/language_condition/validation/waymo_tokenized/combined_language_condition_10hz.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/combined_traj_qa_2hz.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/combined_traj_qa_10hz_long.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/small_overfitting_10hz_long.parquet"
-    data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy_predefined.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy_predefined_pos.parquet"
+    data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy_predefined_grid.parquet"
 
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_map_next_token_10hz_long_grid.parquet"
+
+
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_map_qa_10hz_long_predefined.parquet"
+    
     # custom_dataset = datasets.Dataset.from_parquet(data_path)
 
     table = pq.read_table(data_path)
@@ -423,7 +469,7 @@ def main(
     # Shuffle the dataset and select a batch of samples
     import random
     seed = 42
-    num_samples = min(100, len(custom_dataset))
+    num_samples = min(1000, len(custom_dataset))
     random_rows = custom_dataset.shuffle(seed=seed)[:num_samples]
     batch_size = 1
 
@@ -441,6 +487,12 @@ def main(
         # higher_batch = []
         # lower_batch = []
         # context_batch = []
+
+        sid = random_rows['sid'][i]
+        ego_id = random_rows['ego_id'][i]
+
+        # if (sid != "31f399e2d204e06b" or int(ego_id) != 1256) and (sid != "e3e18f8786bf9121" or int(ego_id) != 681):
+        #     continue
 
         for j in range(i, min(i+batch_size, num_samples)):
             # input_ids = random_rows['input_ids_a'][j]
@@ -509,8 +561,11 @@ def main(
             decoded_context = tokenizer.decode(input_ids_neg_100, skip_special_tokens=True)
             if "Question:" in decoded_context:
                 ego_traj_start_input_id = tokenizer("Answer:", return_tensors="pt").input_ids[0][-1].item()
-            else:
+            elif "Predict" in decoded_context:
                 ego_traj_start_input_id = tokenizer("EGO_TRAJ_START", return_tensors="pt").input_ids[0][-1].item()
+            else:
+                ego_traj_start_input_id = tokenizer("MAP_START", return_tensors="pt").input_ids[0][-1].item()
+
             input_ids_neg_100.append(ego_traj_start_input_id)
             attention_mask_neg_100.append(1)
 

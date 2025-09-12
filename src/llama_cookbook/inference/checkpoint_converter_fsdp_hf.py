@@ -56,7 +56,7 @@ def main(
     model_def = load_llama_from_config(HF_model_path_or_name)
     print("model is loaded from config")
     # extend the model embedding size to match the FSDP sharded model
-    model_def.resize_token_embeddings(130233) # hardcoded for now, if error, change accordingly
+    model_def.resize_token_embeddings(129331) # hardcoded for now, if error, change accordingly
     print("model embedding size is extended to match the FSDP sharded model")
     # load the FSDP sharded checkpoints into the model
     try:

@@ -84,7 +84,7 @@ def load_model_sharded(model, rank, cfg):
         print(f"Sharded state checkpoint loaded from {load_dir}")
 
 
-def save_model_and_optimizer_sharded(model, rank, cfg,optim=None):
+def save_model_and_optimizer_sharded(model, rank, cfg,optim=None, epoch=None):
     """save model and optimizer via sharded_state_dict to save_dir"""
     
     folder_name = (
@@ -94,6 +94,9 @@ def save_model_and_optimizer_sharded(model, rank, cfg,optim=None):
         + "-"
         + cfg.model_name
     )
+
+    if epoch is not None:
+        folder_name = folder_name + f"/{epoch}"
 
     save_dir = Path.cwd() / folder_name
     if rank == 0:
