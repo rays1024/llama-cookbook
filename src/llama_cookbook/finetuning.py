@@ -194,18 +194,28 @@ def main(**kwargs):
     ROAD_TYPE_TOKEN = [
         "LaneCenter-Freeway",
         "LaneCenter-SurfaceStreet",
-        "RoadLine-BrokenSingleWhite",
-        "RoadLine-SolidSingleWhite",
-        "RoadLine-SolidDoubleWhite",
-        "RoadLine-BrokenSingleYellow",
-        "RoadLine-BrokenDoubleYellow",
-        "Roadline-SolidSingleYellow",
-        "Roadline-SolidDoubleYellow",
-        "RoadLine-PassingDoubleYellow",
+        "RoadEdgeBoundary",
+        "RoadEdgeMedian",
         "StopSign",
         "Crosswalk",
         "SpeedBump"
     ]
+
+    # ROAD_TYPE_TOKEN = [
+    #     "LaneCenter-Freeway",
+    #     "LaneCenter-SurfaceStreet",
+    #     "RoadLine-BrokenSingleWhite",
+    #     "RoadLine-SolidSingleWhite",
+    #     "RoadLine-SolidDoubleWhite",
+    #     "RoadLine-BrokenSingleYellow",
+    #     "RoadLine-BrokenDoubleYellow",
+    #     "Roadline-SolidSingleYellow",
+    #     "Roadline-SolidDoubleYellow",
+    #     "RoadLine-PassingDoubleYellow",
+    #     "StopSign",
+    #     "Crosswalk",
+    #     "SpeedBump"
+    # ]
     
     # ROAD_TYPE_TOKEN = [
     #     "LaneCenter-Freeway",
@@ -259,18 +269,19 @@ def main(**kwargs):
     #         custom_tokens.append(f'{d}{a}')
 
 
-    angle_bins = np.load('/p/ruishen/processed_waymo_data/validation/waymo_vectorized/combined_angle_bins_10hz_512.npy', allow_pickle=True)
-    len_vals = np.arange(0, 3.51, 0.01)
-    len_type = [f"LEN_{val:.2f}" for val in len_vals]
-    len_type.append("LEN_10.00")
-    dir_type = [f"VEC_{i}" for i in range(len(angle_bins))]
-    acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
+    # angle_bins = np.load('/p/ruishen/processed_waymo_data/validation/waymo_vectorized/combined_angle_bins_10hz_512.npy', allow_pickle=True)
+    # len_vals = np.arange(0, 3.51, 0.01)
+    # len_type = [f"LEN_{val:.2f}" for val in len_vals]
+    # len_type.append("LEN_10.00")
+    # dir_type = [f"VEC_{i}" for i in range(len(angle_bins))]
+    # acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
 
-    custom_tokens = []
-    custom_tokens.extend(acc_type)
-    custom_tokens.extend(len_type)
-    custom_tokens.extend(dir_type)
+    # custom_tokens = []
+    # custom_tokens.extend(acc_type)
+    # custom_tokens.extend(len_type)
+    # custom_tokens.extend(dir_type)
     
+    custom_tokens = [f"VEC_{i}" for i in range(1024)]
 
     custom_tokens.extend(ROAD_TYPE_TOKEN)
 
@@ -298,7 +309,25 @@ def main(**kwargs):
     # custom_tokens.append('AGENT_TRAJ_START')
     # custom_tokens.append('AGENT_TRAJ_END')
 
-    custom_tokens.append('START_')
+    # custom_tokens.append('START_')
+    # custom_tokens.append('AGENT_ID_')
+    # custom_tokens.append('AGENT_TYPE_Vehicle')
+    # custom_tokens.append('AGENT_TYPE_Pedestrian')
+    # custom_tokens.append('AGENT_TYPE_Cyclist')
+    # custom_tokens.append('AGENT_TYPE_Other')
+    # custom_tokens.append('AGENT_TYPE_Unset')
+    # custom_tokens.append('TRAJ_NONE')
+    # custom_tokens.append('CTRL_NONE')
+    # custom_tokens.append('POS_')
+    # custom_tokens.append('POS_NONE')
+    # custom_tokens.append('EGO_TRAJ_START')
+    # custom_tokens.append('EGO_TRAJ_END')
+    # custom_tokens.append('AGENT_TRAJ_START')
+    # custom_tokens.append('AGENT_TRAJ_END')
+    # custom_tokens.append('MAP_START')
+    # custom_tokens.append('MAP_END')
+    # custom_tokens.append('INITIAL_HEADING_')
+
     custom_tokens.append('AGENT_ID_')
     custom_tokens.append('AGENT_TYPE_Vehicle')
     custom_tokens.append('AGENT_TYPE_Pedestrian')
@@ -315,7 +344,8 @@ def main(**kwargs):
     custom_tokens.append('AGENT_TRAJ_END')
     custom_tokens.append('MAP_START')
     custom_tokens.append('MAP_END')
-    custom_tokens.append('INITIAL_HEADING_')
+    custom_tokens.append('ROAD_START')
+    custom_tokens.append('ROAD_END')
 
     tokenizer.add_tokens(custom_tokens)
 

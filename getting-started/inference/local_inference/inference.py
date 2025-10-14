@@ -133,18 +133,28 @@ def main(
     ROAD_TYPE_TOKEN = [
         "LaneCenter-Freeway",
         "LaneCenter-SurfaceStreet",
-        "RoadLine-BrokenSingleWhite",
-        "RoadLine-SolidSingleWhite",
-        "RoadLine-SolidDoubleWhite",
-        "RoadLine-BrokenSingleYellow",
-        "RoadLine-BrokenDoubleYellow",
-        "Roadline-SolidSingleYellow",
-        "Roadline-SolidDoubleYellow",
-        "RoadLine-PassingDoubleYellow",
+        "RoadEdgeBoundary",
+        "RoadEdgeMedian",
         "StopSign",
         "Crosswalk",
         "SpeedBump"
     ]
+
+    # ROAD_TYPE_TOKEN = [
+    #     "LaneCenter-Freeway",
+    #     "LaneCenter-SurfaceStreet",
+    #     "RoadLine-BrokenSingleWhite",
+    #     "RoadLine-SolidSingleWhite",
+    #     "RoadLine-SolidDoubleWhite",
+    #     "RoadLine-BrokenSingleYellow",
+    #     "RoadLine-BrokenDoubleYellow",
+    #     "Roadline-SolidSingleYellow",
+    #     "Roadline-SolidDoubleYellow",
+    #     "RoadLine-PassingDoubleYellow",
+    #     "StopSign",
+    #     "Crosswalk",
+    #     "SpeedBump"
+    # ]
 
     # ROAD_TYPE_TOKEN = [
     #     "LaneCenter-Freeway",
@@ -198,17 +208,19 @@ def main(
     #         custom_tokens.append(f'{d}{a}')
 
 
-    angle_bins = np.load('/p/ruishen/processed_waymo_data/validation/waymo_vectorized/combined_angle_bins_10hz_512.npy', allow_pickle=True)
-    len_vals = np.arange(0, 3.51, 0.01)
-    len_type = [f"LEN_{val:.2f}" for val in len_vals]
-    len_type.append("LEN_10.00")
-    dir_type = [f"VEC_{i}" for i in range(len(angle_bins))]
-    acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
+    # angle_bins = np.load('/p/ruishen/processed_waymo_data/validation/waymo_vectorized/combined_angle_bins_10hz_512.npy', allow_pickle=True)
+    # len_vals = np.arange(0, 3.51, 0.01)
+    # len_type = [f"LEN_{val:.2f}" for val in len_vals]
+    # len_type.append("LEN_10.00")
+    # dir_type = [f"VEC_{i}" for i in range(len(angle_bins))]
+    # acc_type = [f'ACC_{round(i, 3)}' for i in [x * 0.005 for x in range(-20, 21)]]
 
-    custom_tokens = []
-    custom_tokens.extend(acc_type)
-    custom_tokens.extend(len_type)
-    custom_tokens.extend(dir_type)
+    # custom_tokens = []
+    # custom_tokens.extend(acc_type)
+    # custom_tokens.extend(len_type)
+    # custom_tokens.extend(dir_type)
+
+    custom_tokens = [f"VEC_{i}" for i in range(1024)]
 
     custom_tokens.extend(ROAD_TYPE_TOKEN)
 
@@ -235,7 +247,25 @@ def main(
     # custom_tokens.append('MAP_END')
     # custom_tokens.append('INITIAL_HEADING_')
 
-    custom_tokens.append('START_')
+    # custom_tokens.append('START_')
+    # custom_tokens.append('AGENT_ID_')
+    # custom_tokens.append('AGENT_TYPE_Vehicle')
+    # custom_tokens.append('AGENT_TYPE_Pedestrian')
+    # custom_tokens.append('AGENT_TYPE_Cyclist')
+    # custom_tokens.append('AGENT_TYPE_Other')
+    # custom_tokens.append('AGENT_TYPE_Unset')
+    # custom_tokens.append('TRAJ_NONE')
+    # custom_tokens.append('CTRL_NONE')
+    # custom_tokens.append('POS_')
+    # custom_tokens.append('POS_NONE')
+    # custom_tokens.append('EGO_TRAJ_START')
+    # custom_tokens.append('EGO_TRAJ_END')
+    # custom_tokens.append('AGENT_TRAJ_START')
+    # custom_tokens.append('AGENT_TRAJ_END')
+    # custom_tokens.append('MAP_START')
+    # custom_tokens.append('MAP_END')
+    # custom_tokens.append('INITIAL_HEADING_')
+
     custom_tokens.append('AGENT_ID_')
     custom_tokens.append('AGENT_TYPE_Vehicle')
     custom_tokens.append('AGENT_TYPE_Pedestrian')
@@ -252,7 +282,8 @@ def main(
     custom_tokens.append('AGENT_TRAJ_END')
     custom_tokens.append('MAP_START')
     custom_tokens.append('MAP_END')
-    custom_tokens.append('INITIAL_HEADING_')
+    custom_tokens.append('ROAD_START')
+    custom_tokens.append('ROAD_END')
 
     tokenizer.add_tokens(custom_tokens)
 
@@ -315,7 +346,6 @@ def main(
                 # output_attentions=True,
                 # output_scores=True,
                 return_dict_in_generate=True,
-                eos_token_id=None,
                 pad_token_id=tokenizer.eos_token_id,
                 **kwargs,
             )
@@ -439,13 +469,26 @@ def main(
     # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy_predefined.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy_predefined_pos.parquet"
-    data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy_predefined_grid.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_zero_xy_predefined_grid.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/test/waymo_tokenized/combined_traj_prediction_10hz_all_vec_1024.parquet"
 
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_map_next_token_10hz_long_grid.parquet"
 
 
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_map_qa_10hz_long_predefined.parquet"
     
+
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec.parquet"
+
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_context_next_token_10hz_all_vec.parquet"
+
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/combined_traj_next_token_10hz_all_vec.parquet"
+
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/traj_pred_raw_traj.parquet"
+
+    data_path = "/p/ruishen/processed_waymo_data/validation/token_to_centroid.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/centroid_to_token.parquet"
+
     # custom_dataset = datasets.Dataset.from_parquet(data_path)
 
     table = pq.read_table(data_path)
@@ -473,9 +516,8 @@ def main(
     random_rows = custom_dataset.shuffle(seed=seed)[:num_samples]
     batch_size = 1
 
-    # target_sid, target_ego_id = "fe9abb8ae49ba98a", 2056
-    target_sid, target_ego_id = random_rows['sid'][20], int(random_rows['ego_id'][20])
-    print(f"Target SID: {target_sid}, Target Ego ID: {target_ego_id}")
+    # target_sid, target_ego_id = "e3e18f8786bf9121", 681
+    # print(f"Target SID: {target_sid}, Target Ego ID: {target_ego_id}")
 
     for i in tqdm(range(0, num_samples, batch_size), desc="Processing samples"):
         input_ids_batch = []
@@ -488,10 +530,13 @@ def main(
         # lower_batch = []
         # context_batch = []
 
-        sid = random_rows['sid'][i]
-        ego_id = random_rows['ego_id'][i]
+        # sid = random_rows['sid'][i]
+        # ego_id = random_rows['ego_id'][i]
 
-        # if (sid != "31f399e2d204e06b" or int(ego_id) != 1256) and (sid != "e3e18f8786bf9121" or int(ego_id) != 681):
+        # if (sid != "31f399e2d204e06b" or int(ego_id) != 1256) and (sid != "e3e18f8786bf9121" or int(ego_id) != 681) and (sid != "f657cdbf992acd32" or int(ego_id) != 705):
+        #     continue
+
+        # if sid != target_sid or int(ego_id) != target_ego_id:
         #     continue
 
         for j in range(i, min(i+batch_size, num_samples)):
@@ -499,11 +544,14 @@ def main(
             # attention_mask = random_rows['attention_mask_a'][j]
             # labels = random_rows['labels_a'][j]
             
-            sid = random_rows['sid'][j]
-            ego_id = random_rows['ego_id'][j]
+            # sid = random_rows['sid'][j]
+            # ego_id = random_rows['ego_id'][j]
             # question = random_rows['question'][j]
             # higher = random_rows['higher'][j]
             # lower = random_rows['lower'][j]
+
+            sid = "31f399e2d204e06b"
+            ego_id = 1256
 
             input_ids = random_rows['input_ids'][j]
             attention_mask = random_rows['attention_mask'][j]
@@ -548,6 +596,29 @@ def main(
             attention_mask = [x for x in attention_mask if x != 0]
             labels = labels[:len(input_ids)]
 
+
+            # # Map next token prediction
+            # decoded = tokenizer.decode(labels)
+            # road_positions = [i for i in range(len(decoded)) if decoded.startswith("ROAD_START", i)]
+            # middle_idx = road_positions[len(road_positions) // 2]
+            # after_middle = decoded[middle_idx:]
+
+            # # find all VEC_ positions
+            # vec_positions_rel = [i for i in range(len(after_middle)) if after_middle.startswith("VEC_", i)]
+
+            # if len(vec_positions_rel) >= 5:
+            #     split_idx_rel = vec_positions_rel[4]  # 5th occurrence (0-based index)
+            # else:
+            #     split_idx_rel = vec_positions_rel[-1]  # fallback: last available
+
+            # vec_pos = middle_idx + split_idx_rel
+            # part1, part2 = decoded[:vec_pos], decoded[vec_pos:]
+
+            # part1_ids = tokenizer(part1, add_special_tokens=False).input_ids
+            # part2_ids = tokenizer(part2, add_special_tokens=False).input_ids
+            # final_labels = [-100] * len(part1_ids) + part2_ids
+            # labels = final_labels
+
             # Get indices for labels conditions
             indices_neg_100 = [i for i, label in enumerate(labels) if label == -100]
             indices_greater_0 = [i for i, label in enumerate(labels) if label > 0]
@@ -558,16 +629,18 @@ def main(
 
             input_ids_greater_0 = [input_ids[i] for i in indices_greater_0]
 
-            decoded_context = tokenizer.decode(input_ids_neg_100, skip_special_tokens=True)
-            if "Question:" in decoded_context:
-                ego_traj_start_input_id = tokenizer("Answer:", return_tensors="pt").input_ids[0][-1].item()
-            elif "Predict" in decoded_context:
-                ego_traj_start_input_id = tokenizer("EGO_TRAJ_START", return_tensors="pt").input_ids[0][-1].item()
-            else:
-                ego_traj_start_input_id = tokenizer("MAP_START", return_tensors="pt").input_ids[0][-1].item()
+            ego_traj_start_input_id = tokenizer("EGO_TRAJ_START", return_tensors="pt").input_ids[0][-1].item()
 
-            input_ids_neg_100.append(ego_traj_start_input_id)
-            attention_mask_neg_100.append(1)
+            # decoded_context = tokenizer.decode(input_ids_neg_100, skip_special_tokens=True)
+            # if "Question:" in decoded_context:
+            #     ego_traj_start_input_id = tokenizer("Answer:", return_tensors="pt").input_ids[0][-1].item()
+            # elif "Predict" in decoded_context:
+            #     ego_traj_start_input_id = tokenizer("EGO_TRAJ_START", return_tensors="pt").input_ids[0][-1].item()
+            # else:
+            #     ego_traj_start_input_id = tokenizer("MAP_START", return_tensors="pt").input_ids[0][-1].item()
+
+            # input_ids_neg_100.append(ego_traj_start_input_id)
+            # attention_mask_neg_100.append(1)
 
             # Store the batch data
             input_ids_batch.append(input_ids_neg_100)
@@ -617,7 +690,7 @@ def main(
             # 'context_batch': context_batch
         }
 
-        for i in range(6):
+        for i in range(1):
             inference(batch, temperature, top_p, top_k, max_new_tokens, **kwargs)
         # inference(batch, temperature, top_p, top_k, max_new_tokens, **kwargs)
 

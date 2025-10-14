@@ -22,7 +22,7 @@ import json
 from llama_cookbook.model_checkpointing import save_fsdp_model_checkpoint_full, save_model_and_optimizer_sharded, save_optimizer_checkpoint, save_peft_checkpoint, save_model_checkpoint
 from llama_cookbook.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_cookbook.utils.memory_utils import MemoryTrace
-from llama_cookbook.utils.aux_loss import ade_loss
+from llama_cookbook.utils.aux_loss import ade_loss, ce_loss_by_type, ade_loss_all_vec
 from accelerate.utils import is_xpu_available, is_ccl_available
 from llama_cookbook.utils.flop_utils import FlopMeasure
 import torch.nn as nn
@@ -236,54 +236,46 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                                 loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                             else:
-                                # loss = model(**batch).loss
+                                loss = model(**batch).loss
 
-                                # CE loss and ade loss
+                                # # ce and ade loss only
                                 # outputs = model(**batch)
-                                # main_loss = outputs.loss
+                                # logits = outputs.logits
                                 # labels = batch["labels"]
-                                # task_mask = (labels == 129324).any(dim=1)  # Check if any label is EGO_TRAJ_START
-                                # if task_mask.any():
-                                #     special_inputs = {k: v[task_mask] for k, v in batch.items()}
-                                #     sid = [s for s, keep in zip(sid, task_mask) if keep]
-                                #     ego_id = [e for e, keep in zip(ego_id, task_mask) if keep]
-                                #     logits_all = outputs.logits
-                                #     logits_sp = logits_all[task_mask]
-                                #     generated_texts = logits_sp.argmax(dim=-1)
-                                #     generated_texts = tokenizer.batch_decode(generated_texts, skip_special_tokens=True)
-                                #     ct = special_inputs.get("input_ids", None)
-                                #     ct = tokenizer.batch_decode(ct, skip_special_tokens=True)
-                                #     ade, aux_loss, default_ade = ade_loss(generated_texts, sid, ego_id, context=ct)
+                                # aux_loss, ade, _ = ade_loss_all_vec(logits, top_k=10, sid=sid, ego_id=ego_id, weight=1.0, tokenizer=tokenizer, labels=labels)
+                                # ce = outputs.loss
+                                # aux_weight = 0.1
+                                # # cur_step = step + epoch * len(train_dataloader)
+                                # # aux_weight = min(1.0, 0.3 + (cur_step/2400) * 0.1)
+                                # loss = (1-aux_weight) * ce + aux_weight * aux_loss
 
-                                #     loss = (main_loss + aux_loss) / 2
-                                # else:
-                                #     loss = main_loss
+                                # traj_token_loss = ce_loss_by_type(logits, labels, tokenizer, ignore_index=-100, reduction="mean")
 
-                                # ade loss only
-                                outputs = model(**batch)
-                                logits = outputs.logits
-                                labels = batch["labels"]
-                                aux_loss, ade, _ = ade_loss(logits, top_k=5, sid=sid, ego_id=ego_id, weight=1.0, tokenizer=tokenizer, labels=labels)
-                                ce = outputs.loss
-                                aux_weight = 0.2 + 0.6 * min(epoch / train_config.num_epochs, 1.0)
-                                loss = (1-aux_weight) * ce + aux_weight * aux_loss
-
-                                if step % 200 == 0:
-                                    folder_name = (
-                                            train_config.dist_checkpoint_root_folder
-                                            + "/"
-                                            + train_config.dist_checkpoint_folder
-                                            + "-"
-                                            + train_config.model_name
-                                        )
-                                    if not os.path.exists(f"{folder_name}/logs"):
-                                        os.makedirs(f"{folder_name}/logs", exist_ok=True)
-                                    torch.save({
-                                        "epoch": epoch,
-                                        "step": step,
-                                        "logits": logits.detach().cpu(),
-                                        "labels": labels.detach().cpu(),
-                                    }, f"{folder_name}/logs/logits_labels_rank{local_rank}_epoch{epoch}_step{step}.pt")
+                                # if step % 600 == 0:
+                                #     folder_name = (
+                                #             train_config.dist_checkpoint_root_folder
+                                #             + "/"
+                                #             + train_config.dist_checkpoint_folder
+                                #             + "-"
+                                #             + train_config.model_name
+                                #         )
+                                #     if not os.path.exists(f"{folder_name}/logs"):
+                                #         os.makedirs(f"{folder_name}/logs", exist_ok=True)
+                                #     try:
+                                #         if len(os.listdir(f"{folder_name}/logs")) > 30:
+                                #             files = os.listdir(f"{folder_name}/logs")
+                                #             files = [os.path.join(f"{folder_name}/logs", f) for f in files]
+                                #             files.sort(key=os.path.getmtime)
+                                #             for f in files[:3]:
+                                #                 os.remove(f)
+                                #         torch.save({
+                                #             "epoch": epoch,
+                                #             "step": step,
+                                #             "logits": logits.detach().cpu(),
+                                #             "labels": labels.detach().cpu(),
+                                #         }, f"{folder_name}/logs/logits_labels_rank{local_rank}_epoch{epoch}_step{step}.pt")
+                                #     except Exception as e:
+                                #         pass
 
                     total_loss += loss.detach().float()
                     loss = loss / gradient_accumulation_steps
@@ -338,8 +330,64 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 'train/ce': ce,
                                 'train/ade': ade,
                             })
+                        if "traj_token_loss" in locals():
+                            wandb_run.log({
+                                'train/vec_ce_loss': traj_token_loss["vec_loss"],
+                                'train/len_ce_loss': traj_token_loss["len_loss"],
+                                'train/pos_ce_loss': traj_token_loss["pos_loss"],
+                                "train/ade_vec": ade_dict["vec_ade"],
+                                "train/ade_len": ade_dict["len_ade"],
+                            })
 
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
+
+
+                    # if (step + epoch * len(train_dataloader)) % 300 == 0 and step > 0:
+                    #     eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
+                    #     # Check for >20 subdirs and delete oldest if needed
+                    #     output_dir = train_config.output_dir
+                    #     if not os.path.exists(output_dir):
+                    #         os.makedirs(output_dir, exist_ok=True)
+                    #     subdirs = [d for d in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, d))]
+                    #     if len(subdirs) > 20:
+                    #         oldest_dir = min(subdirs, key=lambda d: os.path.getmtime(os.path.join(output_dir, d)))
+                    #         oldest_dir_path = os.path.join(output_dir, oldest_dir)
+                    #         try:
+                    #             import shutil
+                    #             shutil.rmtree(oldest_dir_path)
+                    #             print(f"Deleted oldest directory: {oldest_dir_path}")
+                    #         except Exception as e:
+                    #             print(f"Failed to delete {oldest_dir_path}: {e}")
+                    #     epoch_output_dir = os.path.join(train_config.output_dir, f"step_{step + epoch * len(train_dataloader)}")
+                    #     if not os.path.exists(epoch_output_dir):
+                    #         os.makedirs(epoch_output_dir, exist_ok=True)
+                    #     save_peft_checkpoint(model, epoch_output_dir)
+
+                    # if (step + epoch * len(train_dataloader)) % 1200 == 0 and step > 0:
+                    #     # run evaluation and save model
+                    #     eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
+                    #     print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
+                    #     print("=====================================================")
+                    #     folder_name = (
+                    #         train_config.dist_checkpoint_root_folder
+                    #         + "/"
+                    #         + train_config.dist_checkpoint_folder
+                    #         + "-"
+                    #         + train_config.model_name
+                    #     )
+                    #     if not os.path.exists(folder_name):
+                    #         os.makedirs(folder_name, exist_ok=True)
+                    #     subdirs = [d for d in os.listdir(folder_name) if os.path.isdir(os.path.join(folder_name, d))]
+                    #     if len(subdirs) > 10:
+                    #         oldest_dir = min(subdirs, key=lambda d: os.path.getmtime(os.path.join(folder_name, d)))
+                    #         oldest_dir_path = os.path.join(folder_name, oldest_dir)
+                    #         try:
+                    #             import shutil
+                    #             shutil.rmtree(oldest_dir_path)
+                    #             print(f"Deleted oldest directory: {oldest_dir_path}")
+                    #         except Exception as e:
+                    #             print(f"Failed to delete {oldest_dir_path}: {e}")
+                    #     save_model_and_optimizer_sharded(model, rank, train_config, epoch=step+epoch*len(train_dataloader))
 
                     if train_config.save_metrics:
                         save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
@@ -373,7 +421,6 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 val_step_perplexity.extend(temp_step_perplexity)
             should_save_model = train_config.save_model and eval_epoch_loss < best_val_loss
         
-        should_save_model = True
         checkpoint_start_time = time.perf_counter()
         if should_save_model:
             if train_config.enable_fsdp:
@@ -385,7 +432,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 else:
                     print(f"we are about to save the PEFT modules")
                 
-                epoch_output_dir = os.path.join(train_config.output_dir, f"epoch_{epoch+1}")
+                epoch_output_dir = os.path.join(train_config.output_dir, f"epoch_{epoch}")
                 if not os.path.exists(epoch_output_dir):
                     os.makedirs(epoch_output_dir, exist_ok=True)
                 save_peft_checkpoint(model, epoch_output_dir)
@@ -494,6 +541,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
     val_step_loss = []
     val_step_perplexity = []
     eval_loss = 0.0  # Initialize evaluation loss
+    eval_ade = 0.0
+    eval_ce = 0.0
+    eval_aux_loss = 0.0
     total_eval_steps = 0
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
@@ -598,36 +648,20 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                         loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                     else:
-                        # loss = model(**batch).loss
+                        loss = model(**batch).loss
 
-                        # CE loss and ade loss
+                        # # ce and ade loss only
                         # outputs = model(**batch)
-                        # main_loss = outputs.loss
+                        # logits = outputs.logits
                         # labels = batch["labels"]
-                        # task_mask = (labels == 129324).any(dim=1)  # Check if any label is EGO_TRAJ_START
-                        # if task_mask.any():
-                        #     special_inputs = {k: v[task_mask] for k, v in batch.items()}
-                        #     sid = [s for s, keep in zip(sid, task_mask) if keep]
-                        #     ego_id = [e for e, keep in zip(ego_id, task_mask) if keep]
-                        #     logits_all = outputs.logits
-                        #     logits_sp = logits_all[task_mask]
-                        #     generated_texts = logits_sp.argmax(dim=-1)
-                        #     generated_texts = tokenizer.batch_decode(generated_texts, skip_special_tokens=True)
-                        #     ct = special_inputs.get("input_ids", None)
-                        #     ct = tokenizer.batch_decode(ct, skip_special_tokens=True)
-                        #     ade, aux_loss, default_ade = ade_loss(generated_texts, sid, ego_id, context=ct)
-
-                        #     loss = (main_loss + aux_loss) / 2
-                        # else:
-                        #     loss = main_loss
-
-                        # ade loss only
-                        outputs = model(**batch)
-                        logits = outputs.logits
-                        labels = batch["labels"]
-                        aux_loss, ade, ce = ade_loss(logits, top_k=1, sid=sid, ego_id=ego_id, weight=1.0, tokenizer=tokenizer, labels=labels)
-                        ce = outputs.loss
-                        loss = (aux_loss + ce) / 2
+                        # aux_loss, ade, _ = ade_loss_all_vec(logits, top_k=10, sid=sid, ego_id=ego_id, weight=1.0, tokenizer=tokenizer, labels=labels)
+                        # ce = outputs.loss
+                        # aux_weight = 0.1
+                        # loss = (1-aux_weight) * ce + aux_weight * aux_loss
+                        # eval_ade += ade.detach().float()
+                        # eval_ce += ce.detach().float()
+                        # eval_aux_loss += aux_loss.detach().float()
+                        # traj_token_loss = ce_loss_by_type(logits, labels, tokenizer, ignore_index=-100, reduction="mean")
             
                 if train_config.save_metrics:
                     val_step_loss.append(loss.detach().float().item())
@@ -649,9 +683,16 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
 
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / len(eval_dataloader)
+    eval_ade = eval_ade / len(eval_dataloader)
+    eval_ce = eval_ce / len(eval_dataloader)
+    eval_aux_loss = eval_aux_loss / len(eval_dataloader)
     if train_config.enable_fsdp:
         eval_epoch_loss = eval_epoch_loss/world_size
+        eval_ade = eval_ade / world_size
+        eval_ce = eval_ce / world_size
+        eval_aux_loss = eval_aux_loss / world_size
     eval_ppl = torch.exp(eval_epoch_loss)
+    # eval_ppl = torch.exp(eval_ce)
 
     # Print evaluation metrics
     if train_config.enable_fsdp:
@@ -672,9 +713,17 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
             }, commit=False)
         if "ce" in locals() and "ade" in locals():
             wandb_run.log({
-                'eval/aux_loss': aux_loss,
-                'eval/ce': ce,
-                'eval/ade': ade,
+                'eval/aux_loss': eval_aux_loss,
+                'eval/ce': eval_ce,
+                'eval/ade': eval_ade,
+            }, commit=False)
+        if "traj_token_loss" in locals():
+            wandb_run.log({
+                'eval/vec_ce_loss': traj_token_loss["vec_loss"],
+                'eval/len_ce_loss': traj_token_loss["len_loss"],
+                'eval/pos_ce_loss': traj_token_loss["pos_loss"],
+                "eval/ade_vec": ade_dict["vec_ade"],
+                "eval/ade_len": ade_dict["len_ade"],
             }, commit=False)
 
     return eval_ppl, eval_epoch_loss, val_step_loss, val_step_perplexity
