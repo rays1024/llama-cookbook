@@ -15,6 +15,8 @@ import numpy as np
 
 from accelerate.utils import is_xpu_available
 from llama_cookbook.inference.model_utils import load_model, load_peft_model
+from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
+from transformers import AutoConfig
 
 from llama_cookbook.inference.safety_utils import AgentType, get_safety_checker
 from transformers import AutoTokenizer
@@ -100,7 +102,7 @@ def main(
     model_name,
     peft_model: str = None,
     quantization: str = None, # Options: 4bit, 8bit
-    max_new_tokens: int = 1000,  # The maximum numbers of tokens to generate
+    max_new_tokens: int = 100,  # The maximum numbers of tokens to generate
     prompt_file: str = None,
     seed: int = 42,  # seed value for reproducibility
     do_sample: bool = True,  # Whether or not to use sampling ; use greedy decoding otherwise.
@@ -126,6 +128,8 @@ def main(
     else:
         torch.cuda.manual_seed(seed)
     torch.manual_seed(seed)
+
+    all_centroids = np.load('/p/ruishen/processed_waymo_data/training/waymo_vectorized/all_cluster_centroids_10hz_1024.npy', allow_pickle=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
@@ -294,7 +298,13 @@ def main(
     if os.path.exists(attention_file):
         os.remove(attention_file)
 
-    model = load_model(model_name, quantization, use_fast_kernels, **kwargs)
+    # model = load_model(model_name, quantization, use_fast_kernels, **kwargs)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config = AutoConfig.from_pretrained(model_name)
+    config.use_action_head = True
+    model = LlamaForCausalLMWithActions.from_pretrained(model_name, config=config)
+    model.to(device)
     
     if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
         print(
@@ -338,7 +348,7 @@ def main(
                 do_sample=do_sample,
                 top_p=top_p,
                 temperature=temperature,
-                min_length=min_length,
+                min_length=(len(batch['input_ids'][0]) + 80),
                 use_cache=use_cache,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
@@ -486,8 +496,10 @@ def main(
 
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/traj_pred_raw_traj.parquet"
 
-    data_path = "/p/ruishen/processed_waymo_data/validation/token_to_centroid.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/token_to_centroid.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/validation/centroid_to_token.parquet"
+
+    data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq.parquet"
 
     # custom_dataset = datasets.Dataset.from_parquet(data_path)
 
@@ -497,7 +509,7 @@ def main(
     num_rows = 1000
 
     # Step 2: Use tqdm to visualize loading progress
-    batch_size = 1000
+    batch_size = 100
     rows = []
     for i in tqdm(range(0, num_rows, batch_size), desc="Building dataset"):
         batch = table.slice(i, batch_size)
@@ -512,12 +524,14 @@ def main(
     # Shuffle the dataset and select a batch of samples
     import random
     seed = 42
-    num_samples = min(1000, len(custom_dataset))
+    num_samples = min(100, len(custom_dataset))
     random_rows = custom_dataset.shuffle(seed=seed)[:num_samples]
     batch_size = 1
 
     # target_sid, target_ego_id = "e3e18f8786bf9121", 681
     # print(f"Target SID: {target_sid}, Target Ego ID: {target_ego_id}")
+
+    ade_list = []
 
     for i in tqdm(range(0, num_samples, batch_size), desc="Processing samples"):
         input_ids_batch = []
@@ -550,12 +564,40 @@ def main(
             # higher = random_rows['higher'][j]
             # lower = random_rows['lower'][j]
 
-            sid = "31f399e2d204e06b"
-            ego_id = 1256
+            # sid = "31f399e2d204e06b"
+            # ego_id = 1256
 
             input_ids = random_rows['input_ids'][j]
             attention_mask = random_rows['attention_mask'][j]
             labels = random_rows['labels'][j]
+            sid = random_rows['sid'][j]
+            ego_id = random_rows['ego_id'][j]
+
+
+
+            # input_ids = torch.tensor([input_ids], dtype=torch.long).to(torch.cuda.current_device())
+            # labels = torch.tensor([labels], dtype=torch.long)
+            # with torch.no_grad():
+            #     outputs = model(input_ids=input_ids)
+            # logits = outputs.logits.detach().cpu()
+            # del outputs
+            # torch.cuda.empty_cache()
+            # gc.collect()
+            # mask = labels != -100
+            # k = 50
+            # _, topk_indices = torch.topk(logits, k=k, dim=-1)
+            # valid_topk_indices = topk_indices[mask]
+            # valid_topk_tokens = [
+            #     [tokenizer.decode([idx]) for idx in row]
+            #     for row in valid_topk_indices
+            # ]
+            # with open("aaa_old_top_token_ids.jsonl", 'a') as f:
+            #     entry = {
+            #         'ground_truth': tokenizer.decode(labels[mask].tolist(), skip_special_tokens=True),
+            #         'top_tokens': valid_topk_tokens,
+            #     }
+            #     f.write(json.dumps(entry) + '\n')
+            # continue
 
 
             # to_be_removed = "AGENT_TRAJ_STARTSTART_[725.056, 6424.752]INITIAL_HEADING_-0.036AGENT_ID_2056AGENT_TYPE_VehicleVEH_VEC_27VEH_VEC_72VEH_VEC_107VEH_VEC_295VEH_VEC_107VEH_VEC_65VEH_VEC_295VEH_VEC_107VEH_VEC_65VEH_VEC_4VEH_VEC_237VEH_VEC_107VEH_VEC_237VEH_VEC_107VEH_VEC_65VEH_VEC_65VEH_VEC_65VEH_VEC_65VEH_VEC_4VEH_VEC_4VEH_VEC_179VEH_VEC_4VEH_VEC_113VEH_VEC_65VEH_VEC_4VEH_VEC_22VEH_VEC_65VEH_VEC_22VEH_VEC_22VEH_VEC_66VEH_VEC_113VEH_VEC_196VEH_VEC_113VEH_VEC_89VEH_VEC_89VEH_VEC_66VEH_VEC_106VEH_VEC_238VEH_VEC_141VEH_VEC_141VEH_VEC_238VEH_VEC_141VEH_VEC_141VEH_VEC_71VEH_VEC_95VEH_VEC_136VEH_VEC_165VEH_VEC_11VEH_VEC_95VEH_VEC_165VEH_VEC_11VEH_VEC_95VEH_VEC_231VEH_VEC_33VEH_VEC_95VEH_VEC_367VEH_VEC_33VEH_VEC_95VEH_VEC_87VEH_VEC_95VEH_VEC_367VEH_VEC_95VEH_VEC_87VEH_VEC_95VEH_VEC_33VEH_VEC_367VEH_VEC_95VEH_VEC_87VEH_VEC_33VEH_VEC_95VEH_VEC_33VEH_VEC_367VEH_VEC_112VEH_VEC_367VEH_VEC_112VEH_VEC_367VEH_VEC_33VEH_VEC_112VEH_VEC_231VEH_VEC_33VEH_VEC_165VEH_VEC_112VEH_VEC_367VEH_VEC_112VEH_VEC_367VEH_VEC_95VEH_VEC_87VEH_VEC_33VEH_VEC_95VEH_VEC_367AGENT_TRAJ_END"
@@ -629,7 +671,7 @@ def main(
 
             input_ids_greater_0 = [input_ids[i] for i in indices_greater_0]
 
-            ego_traj_start_input_id = tokenizer("EGO_TRAJ_START", return_tensors="pt").input_ids[0][-1].item()
+            # ego_traj_start_input_id = tokenizer("EGO_TRAJ_START", return_tensors="pt").input_ids[0][-1].item()
 
             # decoded_context = tokenizer.decode(input_ids_neg_100, skip_special_tokens=True)
             # if "Question:" in decoded_context:
@@ -659,7 +701,101 @@ def main(
             # higher_batch.append(higher)
             # lower_batch.append(lower)
             # context_batch.append(context_ids)
-        
+
+        # continue 
+
+
+        input_ids_batch = torch.tensor(input_ids_batch, device=device)
+        attention_mask_batch = torch.tensor(attention_mask_batch, device=device)
+
+        ground_truth = re.findall(r'VEC_(\d+)', ground_truth)
+
+        # top_k = 5
+        # collected_trajectory = []
+        # ground_truth_trajectory = []
+
+        # # First forward pass (full prompt)
+        # with torch.no_grad():
+        #     outputs = model(input_ids_batch, attention_mask=attention_mask_batch, use_cache=True)
+        # past_key_values = outputs.past_key_values
+        # logits = outputs.logits.float().cpu()
+
+        # # Compute top-k next tokens
+        # _, topk_indices = torch.topk(logits[:, -1, :], k=top_k, dim=-1)
+
+        # # Decode tokens individually (important!)
+        # decoded_tokens = [
+        #     tokenizer.decode([int(t)], skip_special_tokens=True)
+        #     for t in topk_indices[0]
+        # ]
+
+        # gt_vec = all_centroids[int(ground_truth[0])]
+        # ground_truth_trajectory.append(gt_vec)
+
+        # # Map decoded tokens to vectors
+        # gen_vec = [all_centroids[int(x.replace("VEC_", ""))] for x in decoded_tokens]
+
+        # # Vectorized distance
+        # dists = np.linalg.norm(np.array(gen_vec) - gt_vec, axis=1)
+        # best_idx = int(np.argmin(dists))
+        # # best_idx = 0  # forcing to take the top-1
+        # best_token = topk_indices[0][best_idx].item()
+
+        # collected_trajectory.append(gen_vec[best_idx])
+
+        # # Prepare single-token tensor
+        # input_ids = torch.tensor([[best_token]], device=device)
+
+        # # Loop through remaining GT tokens
+        # for gt_token in ground_truth:
+        #     attention_mask = torch.ones((1, 1), device=device)
+
+        #     with torch.no_grad():
+        #         outputs = model(
+        #             input_ids,
+        #             attention_mask=attention_mask,
+        #             past_key_values=past_key_values,
+        #             use_cache=True
+        #         )
+
+        #     past_key_values = outputs.past_key_values
+        #     logits = outputs.logits.float().cpu()
+
+        #     _, topk_indices = torch.topk(logits[:, -1, :], k=top_k, dim=-1)
+
+        #     decoded_tokens = [
+        #         tokenizer.decode([int(t)], skip_special_tokens=True)
+        #         for t in topk_indices[0]
+        #     ]
+
+        #     gt_vec = all_centroids[int(gt_token)]
+        #     ground_truth_trajectory.append(gt_vec)
+
+        #     gen_vec = [all_centroids[int(x.replace("VEC_", ""))] for x in decoded_tokens]
+
+        #     dists = np.linalg.norm(np.array(gen_vec) - gt_vec, axis=1)
+        #     best_idx = int(np.argmin(dists))
+        #     # best_idx = 0  # forcing to take the top-1
+        #     best_token = topk_indices[0][best_idx].item()
+
+        #     collected_trajectory.append(gen_vec[best_idx])
+
+        #     # update next token
+        #     input_ids = torch.tensor([[best_token]], device=device)
+
+        # # Write results
+        # gt_traj = np.cumsum(np.array(ground_truth_trajectory), axis=0)
+        # col_traj = np.cumsum(np.array(collected_trajectory), axis=0)
+        # with open("aaa_collected_trajectories.jsonl", 'a') as f:
+        #     entry = {
+        #         'gt_trajectory': gt_traj.tolist(),
+        #         'collected_trajectory': col_traj.tolist(),
+        #     }
+        #     f.write(json.dumps(entry) + '\n')
+
+
+        # continue
+
         # if sid != target_sid or int(ego_id) != target_ego_id:
         #     continue
         
@@ -690,9 +826,8 @@ def main(
             # 'context_batch': context_batch
         }
 
-        for i in range(1):
+        for i in range(6):
             inference(batch, temperature, top_p, top_k, max_new_tokens, **kwargs)
-        # inference(batch, temperature, top_p, top_k, max_new_tokens, **kwargs)
 
         # if sid == target_sid and int(ego_id) == target_ego_id:
         #     exit()

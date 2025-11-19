@@ -118,6 +118,17 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     best_val_loss = float("inf")
     total_train_steps = 0
     max_steps_reached = False  # Flag to indicate max training steps reached
+    # model.set_action_head_trainable(False)
+    # llm_trainable = True
+    # ah_trainable = False
+
+
+    # temporary
+    model.set_language_model_trainable(False)
+    llm_trainable = False
+    # temporary
+
+
     # Start the training loop
     for epoch in range(train_config.num_epochs):
         print(f"Starting epoch {epoch}/{train_config.num_epochs}")
@@ -156,6 +167,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             elif torch.cuda.is_available():
                                 if batch[key] is None:
                                     continue
+                                if key == "pred_seq":
+                                    batch[key] = torch.tensor(batch[key])
                                 batch[key] = batch[key].to('cuda:0')
                     with autocast():
                         if 'input_ids_a' in batch:
@@ -235,6 +248,28 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 # get individual loss for each task type
                                 loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                                 loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
+                            elif train_config.action_head:
+                                output = model(**batch, task='action')
+                                loss = output.loss
+                                action_loss = output.action_prediction_loss
+                                ce_loss = output.cross_entropy_loss
+                                vec_order_loss = output.vec_order_loss
+                                # if (step + epoch * len(train_dataloader)) <= (len(train_dataloader) * 1/2):
+                                #     loss = ce_loss + vec_order_loss * 0.5
+                                # elif (step + epoch * len(train_dataloader)) <= (len(train_dataloader) * 3/4):
+                                #     loss = action_loss
+
+                                # temporary
+                                if (step + epoch * len(train_dataloader)) <= (len(train_dataloader) * 1/10):
+                                    loss = action_loss
+                                elif epoch == 0:
+                                    progress = (step + epoch * len(train_dataloader)) / len(train_dataloader)
+                                    progress = (progress - 0.1)/0.9
+                                    progress = max(0.0, min(1.0, progress))
+                                    action_loss_weight_scale = 1e-3 + progress * (1 - 1e-3)
+                                    loss = action_loss * action_loss_weight_scale + ce_loss + vec_order_loss * 0.5
+                                # temporary
+                                    
                             else:
                                 loss = model(**batch).loss
 
@@ -299,6 +334,16 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     else:
                         # regular backpropagation when fp16 is not used
                         loss.backward()
+
+                        # # check gradient and update
+                        # for name, param in model.module.named_parameters():
+                        #     # check action_decoder gradients
+                        #     if param.grad is not None:
+                        #         grad_mean = param.grad.abs().mean()
+                        #         print(f"Step {step}, Param: {name}, Grad Mean: {grad_mean.item():.6f}")
+                        #     else:
+                        #         print(f"Step {step}, Param: {name}, Grad is None")
+
                         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                             if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
                                 if train_config.enable_fsdp:
@@ -338,6 +383,12 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 "train/ade_vec": ade_dict["vec_ade"],
                                 "train/ade_len": ade_dict["len_ade"],
                             })
+                        if "action_loss" in locals() and "ce_loss" in locals():
+                            wandb_run.log({
+                                'train/action_loss': action_loss.detach().float(),
+                                'train/ce_loss': ce_loss.detach().float(),
+                                'train/vec_order_loss': vec_order_loss.detach().float(),
+                            })
 
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
 
@@ -363,31 +414,56 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     #         os.makedirs(epoch_output_dir, exist_ok=True)
                     #     save_peft_checkpoint(model, epoch_output_dir)
 
-                    # if (step + epoch * len(train_dataloader)) % 1200 == 0 and step > 0:
-                    #     # run evaluation and save model
-                    #     eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
-                    #     print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
-                    #     print("=====================================================")
-                    #     folder_name = (
-                    #         train_config.dist_checkpoint_root_folder
-                    #         + "/"
-                    #         + train_config.dist_checkpoint_folder
-                    #         + "-"
-                    #         + train_config.model_name
-                    #     )
-                    #     if not os.path.exists(folder_name):
-                    #         os.makedirs(folder_name, exist_ok=True)
-                    #     subdirs = [d for d in os.listdir(folder_name) if os.path.isdir(os.path.join(folder_name, d))]
-                    #     if len(subdirs) > 10:
-                    #         oldest_dir = min(subdirs, key=lambda d: os.path.getmtime(os.path.join(folder_name, d)))
-                    #         oldest_dir_path = os.path.join(folder_name, oldest_dir)
-                    #         try:
-                    #             import shutil
-                    #             shutil.rmtree(oldest_dir_path)
-                    #             print(f"Deleted oldest directory: {oldest_dir_path}")
-                    #         except Exception as e:
-                    #             print(f"Failed to delete {oldest_dir_path}: {e}")
-                    #     save_model_and_optimizer_sharded(model, rank, train_config, epoch=step+epoch*len(train_dataloader))
+                    # if (step + epoch * len(train_dataloader)) > (len(train_dataloader) * 1/2) and not ah_trainable:
+                    #     model.set_action_head_trainable(True)
+                    #     model.set_language_model_trainable(False)
+                    #     llm_trainable = False
+                    #     ah_trainable = True
+                    # if (step + epoch * len(train_dataloader)) > (len(train_dataloader) * 3/4) and not llm_trainable:
+                    #     model.set_language_model_trainable(True)
+                    #     llm_trainable = True
+
+                    # temporary
+                    if (step + epoch * len(train_dataloader)) >= (len(train_dataloader) * 1/10) and not llm_trainable:
+                        model.set_language_model_trainable(True)
+                        llm_trainable = True
+                    # temporary
+
+                    if (step + epoch * len(train_dataloader)) % 1000 == 0 and step > 0:
+                        # run evaluation and save model
+                        eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
+                        print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
+                        print("=====================================================")
+                        folder_name = (
+                            train_config.dist_checkpoint_root_folder
+                            + "/"
+                            + train_config.dist_checkpoint_folder
+                            + "-"
+                            + train_config.model_name
+                        )
+                        if not os.path.exists(folder_name):
+                            os.makedirs(folder_name, exist_ok=True)
+                        subdirs = [d for d in os.listdir(folder_name) if os.path.isdir(os.path.join(folder_name, d))]
+                        if len(subdirs) > 10:
+                            oldest_dir = min(subdirs, key=lambda d: os.path.getmtime(os.path.join(folder_name, d)))
+                            oldest_dir_path = os.path.join(folder_name, oldest_dir)
+                            try:
+                                import shutil
+                                shutil.rmtree(oldest_dir_path)
+                                print(f"Deleted oldest directory: {oldest_dir_path}")
+                            except Exception as e:
+                                print(f"Failed to delete {oldest_dir_path}: {e}")
+                        if not train_config.enable_fsdp:
+                            # create epoch output dir
+                            epoch_output_dir = os.path.join(train_config.output_dir, f"step_{step + epoch * len(train_dataloader)}")
+                            if not os.path.exists(epoch_output_dir):
+                                os.makedirs(epoch_output_dir, exist_ok=True)
+                            save_model_checkpoint(model, epoch_output_dir)
+                        else:
+                            if train_config.save_optimizer:
+                                save_model_and_optimizer_sharded(model, rank, train_config, optim=optimizer, epoch=step+epoch*len(train_dataloader))
+                            else:
+                                save_model_and_optimizer_sharded(model, rank, train_config, epoch=step+epoch*len(train_dataloader))
 
                     if train_config.save_metrics:
                         save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
@@ -444,7 +520,11 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
             else:
                 if not train_config.enable_fsdp:
-                    save_model_checkpoint(model, train_config.output_dir)
+                    # create epoch output dir
+                    epoch_output_dir = os.path.join(train_config.output_dir, f"epoch_{epoch}")
+                    if not os.path.exists(epoch_output_dir):
+                        os.makedirs(epoch_output_dir, exist_ok=True)
+                    save_model_checkpoint(model, epoch_output_dir)
                     
                 elif fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
                     print(" Saving the FSDP model checkpoint using FULL_STATE_DICT")
@@ -545,6 +625,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
     eval_ce = 0.0
     eval_aux_loss = 0.0
     total_eval_steps = 0
+    action_loss = 0.0
+    ce_loss = 0.0
+    vec_order_loss = 0.0
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
             sid = batch.pop("sid", None)
@@ -566,6 +649,8 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                     else:
                         if batch[key] is None:
                             continue
+                        if key == "pred_seq":
+                            batch[key] = torch.tensor(batch[key])
                         batch[key] = batch[key].to('cuda:0')
             # Ensure no gradients are computed for this scope to save memory
             with torch.no_grad():
@@ -647,6 +732,12 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         # get individual loss for each task type
                         loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                         loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
+                    elif train_config.action_head:
+                        output = model(**batch, task='action')
+                        loss = output.loss
+                        action_loss += output.action_prediction_loss
+                        ce_loss += output.cross_entropy_loss
+                        vec_order_loss += output.vec_order_loss
                     else:
                         loss = model(**batch).loss
 
@@ -680,19 +771,28 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
     if torch.cuda.device_count() > 1 and train_config.enable_fsdp:
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(action_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(ce_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(vec_order_loss, op=dist.ReduceOp.SUM)
 
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / len(eval_dataloader)
     eval_ade = eval_ade / len(eval_dataloader)
     eval_ce = eval_ce / len(eval_dataloader)
     eval_aux_loss = eval_aux_loss / len(eval_dataloader)
+    action_loss = action_loss / len(eval_dataloader)
+    ce_loss = ce_loss / len(eval_dataloader)
+    vec_order_loss = vec_order_loss / len(eval_dataloader)
     if train_config.enable_fsdp:
         eval_epoch_loss = eval_epoch_loss/world_size
         eval_ade = eval_ade / world_size
         eval_ce = eval_ce / world_size
         eval_aux_loss = eval_aux_loss / world_size
-    eval_ppl = torch.exp(eval_epoch_loss)
-    # eval_ppl = torch.exp(eval_ce)
+        action_loss = action_loss / world_size
+        ce_loss = ce_loss / world_size
+        vec_order_loss = vec_order_loss / world_size
+    # eval_ppl = torch.exp(eval_epoch_loss)
+    eval_ppl = torch.exp(ce_loss)
 
     # Print evaluation metrics
     if train_config.enable_fsdp:
@@ -724,6 +824,12 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                 'eval/pos_ce_loss': traj_token_loss["pos_loss"],
                 "eval/ade_vec": ade_dict["vec_ade"],
                 "eval/ade_len": ade_dict["len_ade"],
+            }, commit=False)
+        if "action_loss" in locals() and "ce_loss" in locals():
+            wandb_run.log({
+                'eval/action_loss': action_loss.detach().float(),
+                'eval/ce_loss': ce_loss.detach().float(),
+                'eval/vec_order_loss': vec_order_loss.detach().float(),
             }, commit=False)
 
     return eval_ppl, eval_epoch_loss, val_step_loss, val_step_perplexity

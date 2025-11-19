@@ -64,6 +64,8 @@ from transformers.models.mllama.modeling_mllama import (
     MllamaVisionEncoderLayer,
 )
 
+from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
+
 
 def setup_wandb(train_config, fsdp_config, **kwargs):
     try:
@@ -136,8 +138,38 @@ def main(**kwargs):
         bnb_config = quant_config.create_bnb_config(train_config.quantization)
 
     # Load the pre-trained model and setup its configuration
+    action_head_enabled = bool(getattr(train_config, "action_head", False))
+    untrained_action_head = bool(
+        getattr(train_config, "untrained_action_head", False)
+    )
+    if untrained_action_head and not action_head_enabled:
+        warn(
+            "untrained_action_head flag is set but action_head is disabled; ignoring the flag."
+        )
+    if action_head_enabled and not os.path.isdir(train_config.model_name):
+        warn(
+            "action_head is enabled but model_name does not point to a local directory; "
+            "extra action head layers will be randomly initialized."
+        )
     use_cache = False if train_config.enable_fsdp else None
     config = AutoConfig.from_pretrained(train_config.model_name)
+    config.use_action_head = action_head_enabled
+    if use_cache is not None:
+        config.use_cache = use_cache
+    if action_head_enabled:
+        config.action_head_output_dim = getattr(
+            train_config, "action_head_output_dim", 4
+        )
+        config.action_head_hidden_dim = getattr(
+            train_config, "action_head_hidden_dim", config.hidden_size
+        )
+        config.action_head_num_layers = max(
+            int(getattr(train_config, "action_head_num_layers", 2)), 1
+        )
+        config.action_head_horizon = max(
+            int(getattr(train_config, "action_head_horizon", 79)), 1
+        )
+
     if config.model_type == "mllama":
         is_vision = True
         model = MllamaForConditionalGeneration.from_pretrained(
@@ -161,27 +193,36 @@ def main(**kwargs):
         model.language_model.supports_gradient_checkpointing = True
     elif config.model_type == "llama":
         is_vision = False
-        if getattr(train_config, "untrained", False):
-            # Load an untrained (randomly initialized) Llama model
-            model = LlamaForCausalLM(config)
-        else:
-            model = LlamaForCausalLM.from_pretrained(
-                train_config.model_name,
-                quantization_config=bnb_config,
-                use_cache=use_cache,
-                attn_implementation="sdpa" if train_config.use_fast_kernels else None,
-                device_map=(
-                    "auto"
-                    if train_config.quantization and not train_config.enable_fsdp
-                    else None
-                ),
-                torch_dtype=torch.float16 if train_config.use_fp16 else "auto",
-            )
+        model_cls = LlamaForCausalLMWithActions if action_head_enabled else LlamaForCausalLM
+        model_loading_kwargs = dict(
+            quantization_config=bnb_config,
+            attn_implementation="sdpa" if train_config.use_fast_kernels else None,
+            device_map=(
+                "auto"
+                if train_config.quantization and not train_config.enable_fsdp
+                else None
+            ),
+            torch_dtype=torch.float16 if train_config.use_fp16 else "auto",
+        )
+        model = model_cls.from_pretrained(
+            train_config.model_name,
+            config=config,
+            **model_loading_kwargs,
+        )
+        if action_head_enabled and untrained_action_head and isinstance(
+            model, LlamaForCausalLMWithActions
+        ):
+            model.reset_action_head_parameters()
+            print("-> Action head parameters reinitialized (untrained_action_head=True).")
         
     else:
         raise ValueError(
             f"Model type {config.model_type} is not supported. Please use llama or mllama model."
         )
+    
+
+    model.to(torch.bfloat16)
+    
     # Load the tokenizer and add special tokens
     tokenizer = AutoTokenizer.from_pretrained(
         train_config.model_name
@@ -349,11 +390,12 @@ def main(**kwargs):
 
     tokenizer.add_tokens(custom_tokens)
 
-
+    model.init_token_id_to_centroid(tokenizer)
 
     # for heirarchical ft onlt
     # tokenizer.model_input_names = ['input_ids_a', 'labels_a', 'attention_mask_a', 'context_ids_b', 'gt_ids_b', 'prompt_ids_b']
-    tokenizer.model_input_names = ['input_ids', 'labels', 'attention_mask', 'identifier']
+    # tokenizer.model_input_names = ['input_ids', 'labels', 'attention_mask', 'identifier']
+    tokenizer.model_input_names = ['input_ids', 'labels', 'attention_mask', 'raw_traj']
 
     # If there is a mismatch between tokenizer vocab size and embedding matrix,
     # throw a warning and then expand the embedding matrix

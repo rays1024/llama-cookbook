@@ -51,3 +51,9 @@ class train_config:
     profiler_dir: str = "PATH/to/save/profiler/results" # will be used if using profiler
     loss_weight: float = 1.0 # weight of the loss function
     untrained: bool = False # if True, the model will be trained from scratch
+    untrained_action_head: bool = False # if True, the action head will be trained from scratch
+    action_head: bool = False # if True, the model will be trained with an additional action prediction head
+    action_head_hidden_dim: int = 3072 # hidden dimension of the action prediction head
+    action_head_output_dim: int = 158 # 2 * 79 steps of future trajectory prediction
+    action_head_num_layers: int = 2 # number of layers in the action prediction head
+    action_head_horizon: int = 79 # number of future steps to predict

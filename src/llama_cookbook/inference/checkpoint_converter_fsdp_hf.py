@@ -29,6 +29,7 @@ def main(
     consolidated_model_path="",  # Path to save the HF converted model checkpoints
     HF_model_path_or_name="",  # Path/ name of the HF model that include config.json and tokenizer_config.json (e.g. meta-llama/Llama-2-7b-chat-hf)
 ):
+    config_overrides = {}
     if HF_model_path_or_name == "":
         try:
             file_name = "train_params.yaml"
@@ -37,12 +38,25 @@ def main(
             # Open the file
             with open(train_params_path, "r") as file:
                 # Load the YAML data
-                data = yaml.safe_load(file)
+                data = yaml.safe_load(file) or {}
 
                 # Access the 'model_name' field
                 HF_model_path_or_name = data.get("model_name")
 
                 print(f"Model name: {HF_model_path_or_name}")
+
+                if data.get("action_head", False) or any(
+                    key in data for key in ("action_head_output_dim", "action_head_hidden_dim", "action_head_num_layers")
+                ):
+                    config_overrides["use_action_head"] = True
+                    if "action_head_output_dim" in data:
+                        config_overrides["action_head_output_dim"] = int(data["action_head_output_dim"])
+                    if "action_head_hidden_dim" in data:
+                        config_overrides["action_head_hidden_dim"] = int(data["action_head_hidden_dim"])
+                    if "action_head_num_layers" in data:
+                        config_overrides["action_head_num_layers"] = int(data["action_head_num_layers"])
+                    if "action_head_horizon" in data:
+                        config_overrides["action_head_horizon"] = int(data["action_head_horizon"])
         except FileNotFoundError:
             print(f"The file {train_params_path} does not exist.")
             HF_model_path_or_name = input("Please enter the model name: ")
@@ -53,7 +67,7 @@ def main(
         pass
 
     # load the HF model definition from config
-    model_def = load_llama_from_config(HF_model_path_or_name)
+    model_def = load_llama_from_config(HF_model_path_or_name, **config_overrides)
     print("model is loaded from config")
     # extend the model embedding size to match the FSDP sharded model
     model_def.resize_token_embeddings(129305) # hardcoded for now, if error, change accordingly

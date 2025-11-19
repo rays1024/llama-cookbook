@@ -15,6 +15,8 @@ from transformers import (
     MllamaForConditionalGeneration,
 )
 
+from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
+
 
 # Function to load the main model for text generation
 def load_model(model_name, quantization, use_fast_kernels, **kwargs):
@@ -54,12 +56,23 @@ def load_peft_model(model, peft_model):
 
 
 # Loading the model from config to load FSDP checkpoints into that
-def load_llama_from_config(config_path):
+def load_llama_from_config(config_path, **config_overrides):
     config = AutoConfig.from_pretrained(config_path)
+    for key, value in config_overrides.items():
+        setattr(config, key, value)
     if config.model_type == "mllama":
         model = MllamaForConditionalGeneration(config=config)
     elif config.model_type == "llama":
-        model = LlamaForCausalLM(config=config)
+        use_action_head = bool(getattr(config, "use_action_head", False))
+        if not use_action_head:
+            for attr in ("action_head_output_dim", "action_head_hidden_dim", "action_head_num_layers"):
+                if hasattr(config, attr):
+                    use_action_head = True
+                    break
+        if use_action_head:
+            model = LlamaForCausalLMWithActions(config=config)
+        else:
+            model = LlamaForCausalLM(config=config)
     else:
         raise ValueError(
             f"Unsupported model type: {config.model_type}, Please use llama or mllama model."

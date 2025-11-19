@@ -86,10 +86,10 @@ def get_custom_dataset(dataset_config, tokenizer, split):
     # else:
     #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_context_next_token_10hz_all_vec.parquet"
 
-    if split == "validation":
-        data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/combined_traj_next_token_10hz_all_vec.parquet"
-    else:
-        data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/combined_traj_next_token_10hz_all_vec.parquet"
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/combined_traj_next_token_10hz_all_vec.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/combined_traj_next_token_10hz_all_vec.parquet"
 
     # if split == "validation":
     #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/combined_qa_10hz_all_vec.parquet"
@@ -111,6 +111,20 @@ def get_custom_dataset(dataset_config, tokenizer, split):
     # else:
     #     data_path = "/p/ruishen/processed_waymo_data/training/centroid_to_token.parquet"
 
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq.parquet"
+
+    if split == "validation":
+        data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_30percent.parquet"
+    else:
+        data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_30percent.parquet"
+
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/combined_traj_next_token_10hz_all_vec_with_seq.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/combined_traj_next_token_10hz_all_vec_with_seq.parquet"
 
     table = pq.read_table(data_path)
 
@@ -122,12 +136,12 @@ def get_custom_dataset(dataset_config, tokenizer, split):
     #     table = table.slice(int(0.1 * table.num_rows), int(0.9 * table.num_rows))
 
     # # for hierarchical reasoning, need to remove the columns that are not used
-    table = table.drop([key for key in table.column_names if key in ["higher", "lower", "question", "answer", "raw_traj"]])
+    table = table.drop([key for key in table.column_names if key in ["higher", "lower", "question", "answer", "raw_traj", "sid", "ego_id"]])
 
     num_rows = table.num_rows
     num_rows = num_rows
-    # if split == "validation":
-    #     num_rows = num_rows // 10
+    if split == "validation":
+        num_rows = num_rows // 20
 
     # Step 2: Use tqdm to visualize loading progress
     batch_size = 100
