@@ -57,6 +57,8 @@ def main(
                         config_overrides["action_head_num_layers"] = int(data["action_head_num_layers"])
                     if "action_head_horizon" in data:
                         config_overrides["action_head_horizon"] = int(data["action_head_horizon"])
+                if data.get("bidirectional_attention", False):
+                    config_overrides["bidirectional_attention"] = True
         except FileNotFoundError:
             print(f"The file {train_params_path} does not exist.")
             HF_model_path_or_name = input("Please enter the model name: ")

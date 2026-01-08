@@ -32,6 +32,8 @@ class custom_dataset:
     train_split: str = "training"
     test_split: str = "validation"
     data_path: str = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_sampling_factor_2.parquet"
+    train_path: str = ""
+    val_path: str = ""
     
 @dataclass
 class llamaguard_toxicchat_dataset:

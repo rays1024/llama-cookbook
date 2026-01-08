@@ -3,8 +3,19 @@
 
 import datasets
 import pyarrow.parquet as pq
+import pyarrow as pa
 import tqdm
-from datasets import Dataset
+import psutil
+import os
+from datasets import Dataset, concatenate_datasets
+
+import psutil
+import os
+
+process = psutil.Process(os.getpid())
+
+def mem_gb():
+    return process.memory_info().rss / (1024 ** 3)
 
 def get_custom_dataset(dataset_config, tokenizer, split):
     # Load parquet file into dataset object
@@ -116,44 +127,108 @@ def get_custom_dataset(dataset_config, tokenizer, split):
     # else:
     #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq.parquet"
 
-    if split == "validation":
-        data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_30percent.parquet"
-    else:
-        data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_30percent.parquet"
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_10percent.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_10percent.parquet"
 
     # if split == "validation":
     #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/combined_traj_next_token_10hz_all_vec_with_seq.parquet"
     # else:
     #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/combined_traj_next_token_10hz_all_vec_with_seq.parquet"
 
-    table = pq.read_table(data_path)
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_context_next_token_10hz_all_vec_norm_True.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_context_next_token_10hz_all_vec_norm_True.parquet"
 
     # if split == "validation":
-    #     # sample a validation set
-    #     table = table.slice(0, int(0.1 * table.num_rows))
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_context_next_token_5hz_all_vec_norm_True.parquet"
     # else:
-    #     # sample a training set
-    #     table = table.slice(int(0.1 * table.num_rows), int(0.9 * table.num_rows))
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_context_next_token_5hz_all_vec_norm_True.parquet"
 
-    # # for hierarchical reasoning, need to remove the columns that are not used
-    table = table.drop([key for key in table.column_names if key in ["higher", "lower", "question", "answer", "raw_traj", "sid", "ego_id"]])
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/all/validation/waymo_tokenized/trimmed_combined_context_next_token_5hz_all_vec_norm_True.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/all/training/waymo_tokenized/trimmed_combined_context_next_token_5hz_all_vec_norm_True.parquet"
 
-    num_rows = table.num_rows
-    num_rows = num_rows
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/all/validation/waymo_tokenized/trimmed_combined_context_next_token_10hz_all_vec_norm_True.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/all/training/waymo_tokenized/trimmed_combined_context_next_token_10hz_all_vec_norm_True.parquet"
+
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True.parquet"
+
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_5hz_all_vec_with_seq_norm_True.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_5hz_all_vec_with_seq_norm_True.parquet"
+
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_10percent_norm_True.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_noisy_10percent_norm_True.parquet"
+
+    # if split == "validation":
+    #     data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True_parallel_decode.parquet"
+    # else:
+    #     data_path = "/p/ruishen/processed_waymo_data/training/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True_parallel_decode.parquet"
+
+    # if split == "validation":
+    #     data_path = "/p/liverobotics/Rui/gsm8k_tokenized_val.parquet"
+    # else:
+    #     data_path = "/p/liverobotics/Rui/gsm8k_tokenized_train.parquet"
+
+
     if split == "validation":
-        num_rows = num_rows // 20
+        data_path = dataset_config.train_path.replace("training", "validation")
+    else:
+        data_path = dataset_config.train_path
 
-    # Step 2: Use tqdm to visualize loading progress
-    batch_size = 100
-    rows = []
-    for i in tqdm.tqdm(range(0, num_rows, batch_size), desc="Building dataset"):
-        batch = table.slice(i, batch_size)
-        batch_dict = batch.to_pydict()
-        # Reorganize row-wise
-        for j in range(len(batch_dict[next(iter(batch_dict))])):
-            rows.append({k: batch_dict[k][j] for k in batch_dict})
+    DROP_COLUMNS = {"higher", "lower", "question", "answer", "raw_traj", "sid", "ego_id"}
 
-    # Step 3: Wrap into HuggingFace Dataset
-    dataset = Dataset.from_list(rows)
+    batch_size = 1000
+    datasets = []
+
+    parquet_file = pq.ParquetFile(data_path)
+
+    num_rows = parquet_file.metadata.num_rows
+    if split == "validation":
+        num_rows = num_rows // 40
+
+    processed_rows = 0
+
+    pbar = tqdm.tqdm(
+        parquet_file.iter_batches(batch_size=batch_size),
+        total=(num_rows + batch_size - 1) // batch_size,
+        desc="Building dataset",
+    )
+
+    for record_batch in pbar:
+        if processed_rows >= num_rows:
+            break
+
+        keep_cols = [c for c in record_batch.schema.names if c not in DROP_COLUMNS]
+        record_batch = record_batch.select(keep_cols)
+
+        remaining = num_rows - processed_rows
+        if record_batch.num_rows > remaining:
+            record_batch = record_batch.slice(0, remaining)
+
+        table = pa.Table.from_batches([record_batch])
+        ds = Dataset(table)
+        datasets.append(ds)
+
+        processed_rows += record_batch.num_rows
+
+        pbar.set_postfix(
+            rows=processed_rows,
+            mem=f"{mem_gb():.2f} GB",
+        )
+
+    dataset = concatenate_datasets(datasets)    
 
     return dataset

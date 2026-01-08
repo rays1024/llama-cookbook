@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 from datasets import Dataset
 
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
+from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
 
 from tqdm import tqdm  # Add tqdm import
 
@@ -96,7 +97,9 @@ def main() -> None:
 
     config = AutoConfig.from_pretrained(args.model_path)
     config.use_action_head = True
-    model = LlamaForCausalLMWithActions.from_pretrained(args.model_path, config=config)
+    # model = LlamaForCausalLMWithActions.from_pretrained(args.model_path, config=config)
+    config.bidirectional_attention = True
+    model = LlamaForBidirectionAttnWithActions.from_pretrained(args.model_path, config=config)
     model.to(device)
     model.eval()
 
@@ -271,7 +274,7 @@ def main() -> None:
     num_rows = 100
 
     # Step 2: Use tqdm to visualize loading progress
-    batch_size = 100
+    batch_size = 10
     rows = []
     for i in tqdm(range(0, num_rows, batch_size), desc="Building dataset"):
         batch = table.slice(i, batch_size)
@@ -295,7 +298,7 @@ def main() -> None:
             row_input_ids = row["input_ids"]
             row_labels = row["labels"]
             row_attention_mask = row.get("attention_mask", None)
-            row_input_ids, row_attention_mask = trim_input_ids(row_input_ids, row_labels, row_attention_mask, keep_first_n=40)
+            # row_input_ids, row_attention_mask = trim_input_ids(row_input_ids, row_labels, row_attention_mask, keep_first_n=40)
             row_pred_seq = row.get("pred_seq", None)
             row_pred_seq = np.stack(row_pred_seq)
 
@@ -329,17 +332,7 @@ def main() -> None:
                     # f.write(json.dumps(json_line) + "\n")
                     # continue
                     
-                    action_output, generation_output = model.generate_actions(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        return_generation_output=True,
-                        pad_token_id=tokenizer.pad_token_id,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        do_sample=True,
-                    )
-
-                    # action_output, generation_output = model.action_head_based_generate_actions(
+                    # action_output, generation_output = model.generate_actions(
                     #     input_ids=input_ids,
                     #     attention_mask=attention_mask,
                     #     return_generation_output=True,
@@ -347,9 +340,38 @@ def main() -> None:
                     #     temperature=args.temperature,
                     #     top_p=args.top_p,
                     #     do_sample=True,
-                    #     tokenizer=tokenizer,
-                    #     max_new_tokens=args.max_new_tokens,
                     # )
+
+                    mask_type_labels = row_labels.copy()
+                    mask_type_labels = _to_tensor(mask_type_labels, dtype=torch.long, device=device).unsqueeze(0)
+                    mask_type_labels = torch.where(mask_type_labels == -100, 1, 2)
+
+                    target_mask = (mask_type_labels == 2).long()
+                    mask_id = -1
+                    input_ids = torch.where(target_mask == 1, mask_id, input_ids)
+
+                    action_output, generation_output = model.action_head_based_generate_actions(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        return_generation_output=True,
+                        pad_token_id=tokenizer.pad_token_id,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        do_sample=True,
+                        tokenizer=tokenizer,
+                        max_new_tokens=args.max_new_tokens,
+                        mask_type_labels=mask_type_labels,
+                    )
+
+                    # generation_output = model.generate(
+                    #     input_ids=input_ids,
+                    #     attention_mask=attention_mask,
+                    #     max_new_tokens=args.max_new_tokens,
+                    #     pad_token_id=tokenizer.pad_token_id,
+                    #     temperature=args.temperature,
+                    #     top_p=args.top_p,
+                    #     do_sample=True,
+                    # )                    
 
                     action_output_flat = action_output
                     action_loss = None
@@ -362,9 +384,10 @@ def main() -> None:
                         action_loss = float(ade)
 
                     decoded_text = None
-                    if tokenizer is not None and args.max_new_tokens > 0:
-                        generated_ids = generation_output.sequences
-                        decoded_text = tokenizer.decode(generated_ids[0][len(input_ids[0]):], skip_special_tokens=True)
+                    # if tokenizer is not None and args.max_new_tokens > 0:
+                    #     generated_ids = generation_output.sequences
+                    #     # decoded_text = tokenizer.decode(generated_ids[0][len(input_ids[0]):], skip_special_tokens=True)
+                    #     decoded_text = tokenizer.decode(generated_ids[0][(mask_type_labels == -100).sum():], skip_special_tokens=True)
 
                     json_line = {
                         "ground_truth": row_pred_seq.tolist() if row_pred_seq is not None else None,

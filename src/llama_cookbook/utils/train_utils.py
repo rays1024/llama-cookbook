@@ -22,7 +22,7 @@ import json
 from llama_cookbook.model_checkpointing import save_fsdp_model_checkpoint_full, save_model_and_optimizer_sharded, save_optimizer_checkpoint, save_peft_checkpoint, save_model_checkpoint
 from llama_cookbook.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_cookbook.utils.memory_utils import MemoryTrace
-from llama_cookbook.utils.aux_loss import ade_loss, ce_loss_by_type, ade_loss_all_vec
+from llama_cookbook.utils.aux_loss import ade_loss, ce_loss_by_type, ade_loss_all_vec, multi_class_ce
 from accelerate.utils import is_xpu_available, is_ccl_available
 from llama_cookbook.utils.flop_utils import FlopMeasure
 import torch.nn as nn
@@ -118,17 +118,12 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     best_val_loss = float("inf")
     total_train_steps = 0
     max_steps_reached = False  # Flag to indicate max training steps reached
-    # model.set_action_head_trainable(False)
-    # llm_trainable = True
-    # ah_trainable = False
-
-
-    # temporary
-    model.set_language_model_trainable(False)
-    llm_trainable = False
-    # temporary
-
-
+    # if train_config.action_head:
+    #     model.set_action_head_trainable(False)
+    #     llm_trainable = True
+    #     ah_trainable = False
+    #     start_cotrain_step = len(train_dataloader) * 3/4
+    steps_per_epoch = len(train_dataloader)
     # Start the training loop
     for epoch in range(train_config.num_epochs):
         print(f"Starting epoch {epoch}/{train_config.num_epochs}")
@@ -160,6 +155,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             else:
                                 if batch[key] is None:
                                     continue
+                                if key == "pred_seq":
+                                    batch[key] = torch.tensor(batch[key])
                                 batch[key] = batch[key].to(local_rank)
                         else:
                             if is_xpu_available():
@@ -248,28 +245,77 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 # get individual loss for each task type
                                 loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                                 loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
-                            elif train_config.action_head:
+                            elif train_config.action_head and not train_config.bidirectional_attention:
                                 output = model(**batch, task='action')
                                 loss = output.loss
                                 action_loss = output.action_prediction_loss
                                 ce_loss = output.cross_entropy_loss
                                 vec_order_loss = output.vec_order_loss
-                                # if (step + epoch * len(train_dataloader)) <= (len(train_dataloader) * 1/2):
-                                #     loss = ce_loss + vec_order_loss * 0.5
-                                # elif (step + epoch * len(train_dataloader)) <= (len(train_dataloader) * 3/4):
-                                #     loss = action_loss
 
-                                # temporary
-                                if (step + epoch * len(train_dataloader)) <= (len(train_dataloader) * 1/10):
-                                    loss = action_loss
-                                elif epoch == 0:
-                                    progress = (step + epoch * len(train_dataloader)) / len(train_dataloader)
-                                    progress = (progress - 0.1)/0.9
-                                    progress = max(0.0, min(1.0, progress))
-                                    action_loss_weight_scale = 1e-3 + progress * (1 - 1e-3)
-                                    loss = action_loss * action_loss_weight_scale + ce_loss + vec_order_loss * 0.5
-                                # temporary
-                                    
+                                loss = ce_loss + vec_order_loss
+
+                                # if total_train_steps <= (len(train_dataloader) * 1/2):
+                                #     loss = ce_loss + vec_order_loss
+                                # elif total_train_steps <= (len(train_dataloader) * 3/4):
+                                #     loss = action_loss
+                                # elif (total_train_steps - start_cotrain_step) / (len(train_dataloader) * 0.5) <= 1.0:
+                                #     progress = (step + epoch * len(train_dataloader) - start_cotrain_step) / (len(train_dataloader) * 0.5)
+                                #     progress = max(0.0, min(1.0, progress))
+                                #     action_loss_weight_scale = 1e-3 + progress * (1 - 1e-3)
+                                #     loss = action_loss * action_loss_weight_scale + ce_loss + vec_order_loss
+                            elif train_config.bidirectional_attention and not train_config.action_head:
+                                mask_type_labels = batch["labels"].clone()
+                                mask_type_labels = torch.where(mask_type_labels == -100,
+                                                               torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
+                                                                torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
+                                batch["mask_type_labels"] = mask_type_labels
+                                loss = model(**batch, tokenizer=tokenizer).loss
+                            elif train_config.bidirectional_attention and train_config.action_head:
+                                mask_type_labels = batch["labels"].clone()
+                                mask_type_labels = torch.where(mask_type_labels == -100,
+                                                               torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
+                                                                torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
+                                batch["mask_type_labels"] = mask_type_labels
+
+                                if train_config.target_masking_schedule:
+                                    # progress = total_train_steps/(len(train_dataloader) * 4)
+                                    # masking_prob = min(1.0, progress)
+
+                                    total_steps = steps_per_epoch * 4
+                                    progress = total_train_steps / total_steps  # 0 → 1 over 4 epochs
+
+                                    num_steps = 6  # 0.5 to 1.0 in increments of 0.1
+                                    step_index = int(progress * num_steps)
+
+                                    masking_prob = min(1.0, 0.5 + 0.1 * step_index)
+                                else:
+                                    masking_prob = 1.0
+                                mask_id = -1
+                                target_mask = batch["labels"] != -100
+                                random_tensor = torch.rand(batch["labels"].shape, device=batch["labels"].device)
+                                mask_positions = (random_tensor < masking_prob) & target_mask
+                                batch["input_ids"][mask_positions] = mask_id
+
+                                output = model(**batch, tokenizer=tokenizer, task='action')
+                                loss = output.loss
+                                action_loss = output.action_prediction_loss
+                                ce_loss = output.cross_entropy_loss
+                                vec_order_loss = output.vec_order_loss
+
+                                # loss = ce_loss
+                                loss = ce_loss + action_loss
+
+                                # loss = action_loss
+
+                                # if total_train_steps <= (len(train_dataloader) * 1/2):
+                                #     loss = ce_loss
+                                # elif total_train_steps <= (len(train_dataloader) * 3/4):
+                                #     loss = action_loss
+                                # elif (total_train_steps - start_cotrain_step) / (len(train_dataloader) * 0.5) <= 1.0:
+                                #     progress = (step + epoch * len(train_dataloader) - start_cotrain_step) / (len(train_dataloader) * 0.5)
+                                #     progress = max(0.0, min(1.0, progress))
+                                #     action_loss_weight_scale = 1e-3 + progress * (1 - 1e-3)
+                                #     loss = action_loss * action_loss_weight_scale + ce_loss
                             else:
                                 loss = model(**batch).loss
 
@@ -362,7 +408,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             wandb_run.log({
                                 'train/epoch': epoch + 1,
                                 'train/step': epoch * len(train_dataloader) + step,
-                                'train/loss': loss.detach().float(),
+                                'train/loss': loss.detach().float() * gradient_accumulation_steps,
                             })
                         if "identifier" in batch:
                             wandb_run.log({
@@ -389,7 +435,6 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 'train/ce_loss': ce_loss.detach().float(),
                                 'train/vec_order_loss': vec_order_loss.detach().float(),
                             })
-
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
 
 
@@ -414,20 +459,15 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     #         os.makedirs(epoch_output_dir, exist_ok=True)
                     #     save_peft_checkpoint(model, epoch_output_dir)
 
-                    # if (step + epoch * len(train_dataloader)) > (len(train_dataloader) * 1/2) and not ah_trainable:
-                    #     model.set_action_head_trainable(True)
-                    #     model.set_language_model_trainable(False)
-                    #     llm_trainable = False
-                    #     ah_trainable = True
-                    # if (step + epoch * len(train_dataloader)) > (len(train_dataloader) * 3/4) and not llm_trainable:
-                    #     model.set_language_model_trainable(True)
-                    #     llm_trainable = True
-
-                    # temporary
-                    if (step + epoch * len(train_dataloader)) >= (len(train_dataloader) * 1/10) and not llm_trainable:
-                        model.set_language_model_trainable(True)
-                        llm_trainable = True
-                    # temporary
+                    # if train_config.action_head:
+                    #     if (step + epoch * len(train_dataloader)) > (len(train_dataloader) * 1/2) and not ah_trainable:
+                    #         model.set_action_head_trainable(True)
+                    #         model.set_language_model_trainable(False)
+                    #         llm_trainable = False
+                    #         ah_trainable = True
+                    #     if (step + epoch * len(train_dataloader)) > (len(train_dataloader) * 3/4) and not llm_trainable:
+                    #         model.set_language_model_trainable(True)
+                    #         llm_trainable = True
 
                     if (step + epoch * len(train_dataloader)) % 1000 == 0 and step > 0:
                         # run evaluation and save model
@@ -497,6 +537,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 val_step_perplexity.extend(temp_step_perplexity)
             should_save_model = train_config.save_model and eval_epoch_loss < best_val_loss
         
+        should_save_model = True
         checkpoint_start_time = time.perf_counter()
         if should_save_model:
             if train_config.enable_fsdp:
@@ -621,13 +662,14 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
     val_step_loss = []
     val_step_perplexity = []
     eval_loss = 0.0  # Initialize evaluation loss
-    eval_ade = 0.0
-    eval_ce = 0.0
-    eval_aux_loss = 0.0
     total_eval_steps = 0
-    action_loss = 0.0
-    ce_loss = 0.0
-    vec_order_loss = 0.0
+    if train_config.action_head:
+        eval_ade = 0.0
+        eval_ce = 0.0
+        eval_aux_loss = 0.0
+        action_loss = 0.0
+        ce_loss = 0.0
+        vec_order_loss = 0.0
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
             sid = batch.pop("sid", None)
@@ -642,6 +684,8 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                 if train_config.enable_fsdp:
                     if batch[key] is None:
                         continue
+                    if key == "pred_seq":
+                        batch[key] = torch.tensor(batch[key])
                     batch[key] = batch[key].to(local_rank)
                 else:
                     if is_xpu_available():
@@ -732,14 +776,43 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         # get individual loss for each task type
                         loss_qa = mean_loss_per_sample[task_type_sum == 0].mean() if (task_type_sum == 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
                         loss_traj = mean_loss_per_sample[task_type_sum != 0].mean() if (task_type_sum != 0).any() else torch.tensor(0.0, device=mean_loss_per_sample.device)
-                    elif train_config.action_head:
+                    elif train_config.action_head and not train_config.bidirectional_attention:
                         output = model(**batch, task='action')
                         loss = output.loss
                         action_loss += output.action_prediction_loss
                         ce_loss += output.cross_entropy_loss
                         vec_order_loss += output.vec_order_loss
+                    elif train_config.bidirectional_attention and not train_config.action_head:
+                        mask_type_labels = batch["labels"].clone()
+                        mask_type_labels = torch.where(mask_type_labels == -100,
+                                                       torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
+                                                        torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
+                        batch["mask_type_labels"] = mask_type_labels
+                        loss = model(**batch, tokenizer=tokenizer).loss
+                    elif train_config.bidirectional_attention and train_config.action_head:
+                        mask_type_labels = batch["labels"].clone()
+                        mask_type_labels = torch.where(mask_type_labels == -100,
+                                                        torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
+                                                        torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
+                        batch["mask_type_labels"] = mask_type_labels
+                        masking_prob = 1.0
+                        mask_id = -1
+                        target_mask = batch["labels"] != -100
+                        random_tensor = torch.rand(batch["labels"].shape, device=batch["labels"].device)
+                        mask_positions = (random_tensor < masking_prob) & target_mask
+                        batch["input_ids"][mask_positions] = mask_id
+                        output = model(**batch, tokenizer=tokenizer, task='action')
+                        action_loss += output.action_prediction_loss
+                        ce_loss += output.cross_entropy_loss
+                        vec_order_loss += output.vec_order_loss
+
+                        loss = output.action_prediction_loss
                     else:
                         loss = model(**batch).loss
+                        # if train_config.get("multi_class_ce", False):
+                        #     loss = multi_class_ce(output.logits, batch["labels"])
+                        # else:
+                        #     loss = output.loss
 
                         # # ce and ade loss only
                         # outputs = model(**batch)
@@ -771,28 +844,35 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
     if torch.cuda.device_count() > 1 and train_config.enable_fsdp:
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(action_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(ce_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(vec_order_loss, op=dist.ReduceOp.SUM)
+        if train_config.action_head:
+            dist.all_reduce(action_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ce_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(vec_order_loss, op=dist.ReduceOp.SUM)
 
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / len(eval_dataloader)
-    eval_ade = eval_ade / len(eval_dataloader)
-    eval_ce = eval_ce / len(eval_dataloader)
-    eval_aux_loss = eval_aux_loss / len(eval_dataloader)
-    action_loss = action_loss / len(eval_dataloader)
-    ce_loss = ce_loss / len(eval_dataloader)
-    vec_order_loss = vec_order_loss / len(eval_dataloader)
+    if train_config.action_head:
+        eval_ade = eval_ade / len(eval_dataloader)
+        eval_ce = eval_ce / len(eval_dataloader)
+        eval_aux_loss = eval_aux_loss / len(eval_dataloader)
+        action_loss = action_loss / len(eval_dataloader)
+        ce_loss = ce_loss / len(eval_dataloader)
+        vec_order_loss = vec_order_loss / len(eval_dataloader)
+
     if train_config.enable_fsdp:
         eval_epoch_loss = eval_epoch_loss/world_size
-        eval_ade = eval_ade / world_size
-        eval_ce = eval_ce / world_size
-        eval_aux_loss = eval_aux_loss / world_size
-        action_loss = action_loss / world_size
-        ce_loss = ce_loss / world_size
-        vec_order_loss = vec_order_loss / world_size
-    # eval_ppl = torch.exp(eval_epoch_loss)
-    eval_ppl = torch.exp(ce_loss)
+        if train_config.action_head:
+            eval_ade = eval_ade / world_size
+            eval_ce = eval_ce / world_size
+            eval_aux_loss = eval_aux_loss / world_size
+            action_loss = action_loss / world_size
+            ce_loss = ce_loss / world_size
+            vec_order_loss = vec_order_loss / world_size
+
+    if train_config.action_head:
+        eval_ppl = torch.exp(ce_loss)
+    else:
+        eval_ppl = torch.exp(eval_epoch_loss)
 
     # Print evaluation metrics
     if train_config.enable_fsdp:

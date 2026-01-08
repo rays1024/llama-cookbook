@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from transformers import LlamaForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-all_centroids = np.load('/p/ruishen/processed_waymo_data/training/waymo_vectorized/all_cluster_centroids_10hz_1024.npy', allow_pickle=True)
+all_centroids = np.load('/p/ruishen/processed_waymo_data/training/waymo_vectorized/all_cluster_centroids_5hz_1024.npy', allow_pickle=True)
 
 def top_p_filtering(logits, top_p=0.9, filter_value=-float("Inf")):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -311,7 +311,7 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         distances = torch.sqrt(torch.sum(diffs ** 2, dim=-1) + 1e-9)
         target_scores = -distances
 
-        alpha = 1.0
+        alpha = 20.0
         weights = torch.exp(-alpha * distances)
         distance_weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
 
@@ -360,8 +360,9 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         output_hidden_states=None,
         return_dict=None,
         task: str = "language",
-        loss_type: Optional[str] = "ade",
+        loss_type: Optional[str] = None,
         loss_horizon: Optional[int] = None,
+        use_multistep_loss: bool = False,
         pred_seq=None,
         use_ce_loss: bool = True,
         **kwargs,
@@ -402,8 +403,7 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             **kwargs,
         )
 
-        # vec_order_loss = self._calculate_vector_order_loss(base_outputs, labels)
-        vec_order_loss = 0.0
+        vec_order_loss = self._calculate_vector_order_loss(base_outputs, labels)
 
         hidden_states = base_outputs.hidden_states[-1]
 
@@ -417,9 +417,16 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         flattened_actions = decoded_actions.reshape(decoded_actions.size(0), -1)
 
         action_loss = None
+        multistep_losses = None
         if pred_seq is not None:
             effective_loss_type = (loss_type or self._default_loss_type).lower()
-            action_loss = self._compute_action_loss(flattened_actions, pred_seq, effective_loss_type, loss_horizon)
+            action_loss, multistep_losses = self._compute_action_loss(
+                flattened_actions,
+                pred_seq,
+                effective_loss_type,
+                loss_horizon,
+                use_multistep_loss=use_multistep_loss,
+            )
 
         ce_loss = base_outputs.loss if (use_ce_loss and base_outputs.loss is not None) else None
         combined_loss = action_loss
@@ -427,8 +434,8 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             ce_loss = ce_loss.to(dtype=combined_loss.dtype if combined_loss is not None else ce_loss.dtype)
             combined_loss = ce_loss if combined_loss is None else combined_loss + ce_loss
             if vec_order_loss is not None:
-                vec_order_loss = vec_order_loss.to(dtype=combined_loss.dtype)
-                combined_loss = combined_loss + vec_order_loss * 0.5
+                vec_order_loss = vec_order_loss.to(dtype=combined_loss.dtype) * 50.0
+                combined_loss = combined_loss + vec_order_loss
 
         action_outputs = CausalLMOutputWithPastAndActions(
             loss=combined_loss,
@@ -443,6 +450,11 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         action_outputs["language_model_loss"] = base_outputs.loss
         action_outputs["cross_entropy_loss"] = ce_loss
         action_outputs["action_prediction_loss"] = action_loss
+        if multistep_losses is not None:
+            action_outputs["action_per_step_loss"] = multistep_losses.get("per_step")
+            action_outputs["action_multistep_loss_5"] = multistep_losses.get("step_5")
+            action_outputs["action_multistep_loss_10"] = multistep_losses.get("step_10")
+            action_outputs["action_multistep_loss_20"] = multistep_losses.get("step_20")
         action_outputs["vec_order_loss"] = vec_order_loss
 
         if not return_dict:
@@ -559,7 +571,8 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         target_seq: torch.Tensor,
         loss_type: str,
         loss_horizon: Optional[int],
-    ) -> torch.Tensor:
+        use_multistep_loss: bool = False,
+    ) -> tuple[torch.Tensor, Optional[dict[str, Optional[torch.Tensor]]]]:
         target_seq = target_seq.to(device=action_output.device)
         horizon, action_dim = self._infer_horizon_and_dim(action_output, target_seq)
         steps = horizon
@@ -569,13 +582,36 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             steps = min(loss_horizon, horizon)
 
         if loss_type == "mse":
-            preds_fp32, targets_fp32 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
-            loss = F.mse_loss(preds_fp32, targets_fp32)
+            if not use_multistep_loss:
+                preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
+                loss = F.mse_loss(preds_bf16, targets_bf16)
+                return loss.to(dtype=action_output.dtype), None
+            loss, multistep_losses = self._compute_multistep_loss(
+                action_output,
+                target_seq,
+                steps,
+                action_dim,
+                loss_type,
+            )
+            return loss.to(dtype=action_output.dtype), multistep_losses
+        elif loss_type == "l1":
+            if not use_multistep_loss:
+                preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
+                loss = torch.mean(torch.abs(preds_bf16 - targets_bf16))
+                return loss.to(dtype=action_output.dtype), None
+            loss, multistep_losses = self._compute_multistep_loss(
+                action_output,
+                target_seq,
+                steps,
+                action_dim,
+                loss_type,
+            )
+            return loss.to(dtype=action_output.dtype), multistep_losses
         elif loss_type == "ade":
             loss = self._compute_ade_loss(action_output, target_seq, horizon, action_dim, steps)
+            return loss.to(dtype=action_output.dtype), None
         else:
-            raise ValueError(f"Unsupported action loss type '{loss_type}'. Use 'mse' or 'ade'.")
-        return loss.to(dtype=action_output.dtype)
+            raise ValueError(f"Unsupported action loss type '{loss_type}'. Use 'l1', 'mse', or 'ade'.")
 
     def _prepare_mse_tensors(
         self,
@@ -590,8 +626,73 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             target_sliced = target_seq[:, :steps, :].reshape(target_seq.size(0), -1)
         else:
             target_sliced = target_seq[:, : steps * action_dim]
-        targets_fp32 = torch.nan_to_num(target_sliced.to(dtype=torch.float32), nan=0.0, posinf=1e6, neginf=-1e6)
-        return pred_sliced, targets_fp32
+        targets_bf16 = torch.nan_to_num(target_sliced.to(dtype=torch.bfloat16), nan=0.0, posinf=1e6, neginf=-1e6)
+        return pred_sliced, targets_bf16
+
+    def _compute_multistep_loss(
+        self,
+        action_output: torch.Tensor,
+        target_seq: torch.Tensor,
+        steps: int,
+        action_dim: int,
+        loss_type: str,
+    ) -> tuple[torch.Tensor, dict[str, Optional[torch.Tensor]]]:
+        batch_size = action_output.size(0)
+        pred_sliced = action_output[:, : steps * action_dim]
+        pred_sliced = torch.nan_to_num(pred_sliced, nan=0.0, posinf=1e6, neginf=-1e6)
+        pred_deltas = pred_sliced.reshape(batch_size, steps, action_dim).to(dtype=torch.float32)
+        pred_deltas = torch.nan_to_num(pred_deltas, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        if target_seq.dim() == 3:
+            target_deltas = target_seq[:, :steps, :]
+        else:
+            target_deltas = target_seq[:, : steps * action_dim].reshape(batch_size, steps, action_dim)
+        target_deltas = torch.nan_to_num(target_deltas.to(dtype=torch.float32), nan=0.0, posinf=1e6, neginf=-1e6)
+
+        def _window_sum(deltas: torch.Tensor, window: int) -> torch.Tensor:
+            if window <= 1:
+                return deltas
+            cumsum = torch.cumsum(deltas, dim=1)
+            padded = torch.cat([torch.zeros_like(cumsum[:, :1, :]), cumsum], dim=1)
+            return padded[:, window:, :] - padded[:, :-window, :]
+
+        def _compute_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            if loss_type == "mse":
+                return F.mse_loss(preds, targets)
+            return torch.mean(torch.abs(preds - targets))
+
+        per_step_pred = pred_deltas.reshape(batch_size, -1)
+        per_step_target = target_deltas.reshape(batch_size, -1)
+        per_step_loss = _compute_loss(per_step_pred, per_step_target)
+
+        losses: dict[str, Optional[torch.Tensor]] = {
+            "per_step": per_step_loss,
+            "step_5": None,
+            "step_10": None,
+            "step_20": None,
+        }
+
+        pred_chunks = [per_step_pred]
+        target_chunks = [per_step_target]
+        for window, key in ((5, "step_5"), (10, "step_10"), (20, "step_20")):
+            if steps < window:
+                continue
+            pred_window = _window_sum(pred_deltas, window).reshape(batch_size, -1)
+            target_window = _window_sum(target_deltas, window).reshape(batch_size, -1)
+            losses[key] = _compute_loss(pred_window, target_window)
+            pred_chunks.append(pred_window)
+            target_chunks.append(target_window)
+
+        combined_pred = torch.cat(pred_chunks, dim=1)
+        combined_target = torch.cat(target_chunks, dim=1)
+        combined_loss = _compute_loss(combined_pred, combined_target)
+
+        output_dtype = action_output.dtype
+        for key, value in losses.items():
+            if value is not None:
+                losses[key] = value.to(dtype=output_dtype)
+
+        return combined_loss.to(dtype=output_dtype), losses
 
     def _compute_ade_loss(
         self,

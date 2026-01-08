@@ -16,6 +16,7 @@ from transformers import (
 )
 
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
+from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
 
 
 # Function to load the main model for text generation
@@ -69,8 +70,10 @@ def load_llama_from_config(config_path, **config_overrides):
                 if hasattr(config, attr):
                     use_action_head = True
                     break
-        if use_action_head:
+        if use_action_head and not bool(getattr(config, "bidirectional_attention", False)):
             model = LlamaForCausalLMWithActions(config=config)
+        elif use_action_head and bool(getattr(config, "bidirectional_attention", False)):
+            model = LlamaForBidirectionAttnWithActions(config=config)
         else:
             model = LlamaForCausalLM(config=config)
     else:

@@ -57,3 +57,7 @@ class train_config:
     action_head_output_dim: int = 158 # 2 * 79 steps of future trajectory prediction
     action_head_num_layers: int = 2 # number of layers in the action prediction head
     action_head_horizon: int = 79 # number of future steps to predict
+    bidirectional_attention: bool = False # if True, use bidirectional attention in the action prediction head
+    target_masking_schedule: bool = False # if True, use target masking schedule in the action prediction head
+    train_data_path: str = "PATH/to/train/dataset"
+    val_data_path: str = "PATH/to/val/dataset"

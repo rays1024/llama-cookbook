@@ -6,6 +6,7 @@ import os
 import random
 from collections import Counter
 from warnings import warn
+import psutil
 
 import fire
 import numpy as np
@@ -65,7 +66,8 @@ from transformers.models.mllama.modeling_mllama import (
 )
 
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
-
+from llama_cookbook.utils.bidirection_attn_llama import LlamaForBidirectionAttn
+from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
 
 def setup_wandb(train_config, fsdp_config, **kwargs):
     try:
@@ -193,7 +195,14 @@ def main(**kwargs):
         model.language_model.supports_gradient_checkpointing = True
     elif config.model_type == "llama":
         is_vision = False
-        model_cls = LlamaForCausalLMWithActions if action_head_enabled else LlamaForCausalLM
+        if action_head_enabled and not train_config.bidirectional_attention:
+            model_cls = LlamaForCausalLMWithActions
+        elif train_config.bidirectional_attention and not action_head_enabled:
+            model_cls = LlamaForBidirectionAttn
+        elif train_config.bidirectional_attention and action_head_enabled:
+            model_cls = LlamaForBidirectionAttnWithActions
+        else:
+            model_cls = LlamaForCausalLM
         model_loading_kwargs = dict(
             quantization_config=bnb_config,
             attn_implementation="sdpa" if train_config.use_fast_kernels else None,
@@ -390,7 +399,8 @@ def main(**kwargs):
 
     tokenizer.add_tokens(custom_tokens)
 
-    model.init_token_id_to_centroid(tokenizer)
+    if train_config.action_head:
+        model.init_token_id_to_centroid(tokenizer)
 
     # for heirarchical ft onlt
     # tokenizer.model_input_names = ['input_ids_a', 'labels_a', 'attention_mask_a', 'context_ids_b', 'gt_ids_b', 'prompt_ids_b']
@@ -522,6 +532,9 @@ def main(**kwargs):
         dataset_processer = processor
     else:
         dataset_processer = tokenizer
+
+    dataset_config.train_path = train_config.train_data_path
+    dataset_config.val_path = train_config.val_data_path
 
     # Load and preprocess the dataset for training and validation
 
