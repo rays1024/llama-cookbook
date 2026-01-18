@@ -37,7 +37,9 @@ class CausalLMOutputWithPastAndActions(CausalLMOutputWithPast):
     cross_entropy_loss: Optional[torch.FloatTensor] = None
     action_prediction_loss: Optional[torch.FloatTensor] = None
     vec_order_loss: Optional[torch.FloatTensor] = None
-
+    action_fde_loss_30: Optional[torch.FloatTensor] = None
+    action_fde_loss_50: Optional[torch.FloatTensor] = None
+    action_fde_loss_79: Optional[torch.FloatTensor] = None
 
 class MLPResNetBlock(nn.Module):
     """Residual MLP block with pre-layer normalization."""
@@ -362,12 +364,18 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         task: str = "language",
         loss_type: Optional[str] = None,
         loss_horizon: Optional[int] = None,
-        use_multistep_loss: bool = False,
+        use_fde_loss: bool = False,
+        fde_loss_steps: Optional[Tuple[int, ...]] = None,
         pred_seq=None,
         use_ce_loss: bool = True,
         **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if "use_fde_loss" in kwargs:
+            if not use_fde_loss:
+                use_fde_loss = kwargs.pop("use_fde_loss")
+            else:
+                kwargs.pop("use_fde_loss")
 
         if task == "language":
             effective_output_hidden_states = output_hidden_states or self.config.output_hidden_states
@@ -417,15 +425,16 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         flattened_actions = decoded_actions.reshape(decoded_actions.size(0), -1)
 
         action_loss = None
-        multistep_losses = None
+        fde_losses = None
         if pred_seq is not None:
             effective_loss_type = (loss_type or self._default_loss_type).lower()
-            action_loss, multistep_losses = self._compute_action_loss(
+            action_loss, fde_losses = self._compute_action_loss(
                 flattened_actions,
                 pred_seq,
                 effective_loss_type,
                 loss_horizon,
-                use_multistep_loss=use_multistep_loss,
+                use_fde_loss=use_fde_loss,
+                fde_loss_steps=fde_loss_steps,
             )
 
         ce_loss = base_outputs.loss if (use_ce_loss and base_outputs.loss is not None) else None
@@ -450,11 +459,10 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         action_outputs["language_model_loss"] = base_outputs.loss
         action_outputs["cross_entropy_loss"] = ce_loss
         action_outputs["action_prediction_loss"] = action_loss
-        if multistep_losses is not None:
-            action_outputs["action_per_step_loss"] = multistep_losses.get("per_step")
-            action_outputs["action_multistep_loss_5"] = multistep_losses.get("step_5")
-            action_outputs["action_multistep_loss_10"] = multistep_losses.get("step_10")
-            action_outputs["action_multistep_loss_20"] = multistep_losses.get("step_20")
+        if fde_losses is not None:
+            action_outputs["action_fde_loss_30"] = fde_losses.get("step_30")
+            action_outputs["action_fde_loss_50"] = fde_losses.get("step_50")
+            action_outputs["action_fde_loss_79"] = fde_losses.get("step_79")
         action_outputs["vec_order_loss"] = vec_order_loss
 
         if not return_dict:
@@ -571,7 +579,8 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         target_seq: torch.Tensor,
         loss_type: str,
         loss_horizon: Optional[int],
-        use_multistep_loss: bool = False,
+        use_fde_loss: bool = False,
+        fde_loss_steps: Optional[Tuple[int, ...]] = None,
     ) -> tuple[torch.Tensor, Optional[dict[str, Optional[torch.Tensor]]]]:
         target_seq = target_seq.to(device=action_output.device)
         horizon, action_dim = self._infer_horizon_and_dim(action_output, target_seq)
@@ -582,31 +591,25 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             steps = min(loss_horizon, horizon)
 
         if loss_type == "mse":
-            if not use_multistep_loss:
-                preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
-                loss = F.mse_loss(preds_bf16, targets_bf16)
-                return loss.to(dtype=action_output.dtype), None
-            loss, multistep_losses = self._compute_multistep_loss(
+            preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
+            base_loss = F.mse_loss(preds_bf16, targets_bf16)
+            if not use_fde_loss:
+                return base_loss.to(dtype=action_output.dtype), None
+            fde_losses = self._compute_fde_loss(
                 action_output,
                 target_seq,
                 steps,
                 action_dim,
-                loss_type,
+                fde_loss_steps,
             )
-            return loss.to(dtype=action_output.dtype), multistep_losses
+            return base_loss.to(dtype=action_output.dtype), fde_losses
         elif loss_type == "l1":
-            if not use_multistep_loss:
+            if use_fde_loss:
+                raise ValueError("`use_fde_loss=True` requires `loss_type='mse'`.")
+            if not use_fde_loss:
                 preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
                 loss = torch.mean(torch.abs(preds_bf16 - targets_bf16))
                 return loss.to(dtype=action_output.dtype), None
-            loss, multistep_losses = self._compute_multistep_loss(
-                action_output,
-                target_seq,
-                steps,
-                action_dim,
-                loss_type,
-            )
-            return loss.to(dtype=action_output.dtype), multistep_losses
         elif loss_type == "ade":
             loss = self._compute_ade_loss(action_output, target_seq, horizon, action_dim, steps)
             return loss.to(dtype=action_output.dtype), None
@@ -629,13 +632,13 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         targets_bf16 = torch.nan_to_num(target_sliced.to(dtype=torch.bfloat16), nan=0.0, posinf=1e6, neginf=-1e6)
         return pred_sliced, targets_bf16
 
-    def _compute_multistep_loss(
+    def _compute_fde_loss(
         self,
         action_output: torch.Tensor,
         target_seq: torch.Tensor,
         steps: int,
         action_dim: int,
-        loss_type: str,
+        fde_loss_steps: Optional[Tuple[int, ...]] = None,
     ) -> tuple[torch.Tensor, dict[str, Optional[torch.Tensor]]]:
         batch_size = action_output.size(0)
         pred_sliced = action_output[:, : steps * action_dim]
@@ -649,50 +652,46 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             target_deltas = target_seq[:, : steps * action_dim].reshape(batch_size, steps, action_dim)
         target_deltas = torch.nan_to_num(target_deltas.to(dtype=torch.float32), nan=0.0, posinf=1e6, neginf=-1e6)
 
-        def _window_sum(deltas: torch.Tensor, window: int) -> torch.Tensor:
-            if window <= 1:
-                return deltas
-            cumsum = torch.cumsum(deltas, dim=1)
-            padded = torch.cat([torch.zeros_like(cumsum[:, :1, :]), cumsum], dim=1)
-            return padded[:, window:, :] - padded[:, :-window, :]
+        pred_positions = torch.cumsum(pred_deltas, dim=1)
+        target_positions = torch.cumsum(target_deltas, dim=1)
 
-        def _compute_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-            if loss_type == "mse":
-                return F.mse_loss(preds, targets)
-            return torch.mean(torch.abs(preds - targets))
+        eval_steps = (30, 50, 79)
+        if fde_loss_steps is None:
+            selected_steps = eval_steps
+        else:
+            selected_steps = tuple(int(step) for step in fde_loss_steps)
 
-        per_step_pred = pred_deltas.reshape(batch_size, -1)
-        per_step_target = target_deltas.reshape(batch_size, -1)
-        per_step_loss = _compute_loss(per_step_pred, per_step_target)
+        if any(step <= 0 for step in selected_steps):
+            raise ValueError("`fde_loss_steps` must contain positive integers.")
+        if any(step not in eval_steps for step in selected_steps):
+            raise ValueError("`fde_loss_steps` must be a subset of (30, 50, 79).")
 
-        losses: dict[str, Optional[torch.Tensor]] = {
-            "per_step": per_step_loss,
-            "step_5": None,
-            "step_10": None,
-            "step_20": None,
-        }
+        seen = set()
+        deduped_selected = []
+        for step in selected_steps:
+            if step not in seen:
+                seen.add(step)
+                deduped_selected.append(step)
+        selected_steps = tuple(deduped_selected)
 
-        pred_chunks = [per_step_pred]
-        target_chunks = [per_step_target]
-        for window, key in ((5, "step_5"), (10, "step_10"), (20, "step_20")):
-            if steps < window:
+        losses: dict[str, Optional[torch.Tensor]] = {f"step_{step}": None for step in eval_steps}
+        for step in eval_steps:
+            if steps < step:
                 continue
-            pred_window = _window_sum(pred_deltas, window).reshape(batch_size, -1)
-            target_window = _window_sum(target_deltas, window).reshape(batch_size, -1)
-            losses[key] = _compute_loss(pred_window, target_window)
-            pred_chunks.append(pred_window)
-            target_chunks.append(target_window)
+            pred_step = pred_positions[:, step - 1, :]
+            target_step = target_positions[:, step - 1, :]
+            losses[f"step_{step}"] = F.mse_loss(pred_step, target_step)
 
-        combined_pred = torch.cat(pred_chunks, dim=1)
-        combined_target = torch.cat(target_chunks, dim=1)
-        combined_loss = _compute_loss(combined_pred, combined_target)
+        available_steps = [step for step in selected_steps if step <= steps]
+        if not available_steps:
+            raise ValueError("`fde_loss_steps` must include at least one step within the loss horizon.")
 
         output_dtype = action_output.dtype
         for key, value in losses.items():
             if value is not None:
                 losses[key] = value.to(dtype=output_dtype)
 
-        return combined_loss.to(dtype=output_dtype), losses
+        return losses
 
     def _compute_ade_loss(
         self,

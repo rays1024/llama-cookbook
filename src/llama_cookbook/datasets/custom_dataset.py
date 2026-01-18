@@ -50,7 +50,7 @@ def get_data_collator(dataset_processer,dataset_config):
 
     module = load_module_from_py_file(module_path.as_posix())
     try:
-        return getattr(module, func_name)(dataset_processer)
+        return getattr(module, func_name)(dataset_processer, dataset_config)
     except AttributeError as e:
         print(f"Can not find the custom data_collator in the dataset.py file ({module_path.as_posix()}).")
         print("Using the default data_collator instead.")

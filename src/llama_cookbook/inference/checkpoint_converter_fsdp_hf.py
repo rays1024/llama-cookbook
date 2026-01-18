@@ -47,7 +47,7 @@ def main(
 
                 if data.get("action_head", False) or any(
                     key in data for key in ("action_head_output_dim", "action_head_hidden_dim", "action_head_num_layers")
-                ):
+                ) or data.get("vec_emb_model", False):
                     config_overrides["use_action_head"] = True
                     if "action_head_output_dim" in data:
                         config_overrides["action_head_output_dim"] = int(data["action_head_output_dim"])
@@ -59,6 +59,8 @@ def main(
                         config_overrides["action_head_horizon"] = int(data["action_head_horizon"])
                 if data.get("bidirectional_attention", False):
                     config_overrides["bidirectional_attention"] = True
+                if data.get("vec_emb_model", False):
+                    config_overrides["vec_emb_model"] = True
         except FileNotFoundError:
             print(f"The file {train_params_path} does not exist.")
             HF_model_path_or_name = input("Please enter the model name: ")

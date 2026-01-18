@@ -61,3 +61,4 @@ class train_config:
     target_masking_schedule: bool = False # if True, use target masking schedule in the action prediction head
     train_data_path: str = "PATH/to/train/dataset"
     val_data_path: str = "PATH/to/val/dataset"
+    vec_emb_model: bool = False # if True, use vector embedding model to encode map and trajectory data

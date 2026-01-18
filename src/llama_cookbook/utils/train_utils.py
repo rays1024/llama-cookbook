@@ -149,6 +149,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             print("max training steps reached, stopping training, total train steps finished: ", total_train_steps-1)
                         break
                     for key in batch.keys():
+                        if train_config.vec_emb_model:
+                            break # skip moving to device here, will be handled in the model forward
                         if train_config.enable_fsdp:
                             if is_xpu_available():
                                 batch[key] = batch[key].to(torch.device(f"xpu:{local_rank}"))
@@ -263,7 +265,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 #     progress = max(0.0, min(1.0, progress))
                                 #     action_loss_weight_scale = 1e-3 + progress * (1 - 1e-3)
                                 #     loss = action_loss * action_loss_weight_scale + ce_loss + vec_order_loss
-                            elif train_config.bidirectional_attention and not train_config.action_head:
+                            elif train_config.bidirectional_attention and not train_config.action_head and not train_config.vec_emb_model:
                                 mask_type_labels = batch["labels"].clone()
                                 mask_type_labels = torch.where(mask_type_labels == -100,
                                                                torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
@@ -296,14 +298,19 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 mask_positions = (random_tensor < masking_prob) & target_mask
                                 batch["input_ids"][mask_positions] = mask_id
 
-                                output = model(**batch, tokenizer=tokenizer, task='action')
+                                output = model(**batch, tokenizer=tokenizer, task='action', use_fde_loss=False)
                                 loss = output.loss
                                 action_loss = output.action_prediction_loss
                                 ce_loss = output.cross_entropy_loss
                                 vec_order_loss = output.vec_order_loss
 
+                                # action_fde_loss_30 = output.action_fde_loss_30
+                                # action_fde_loss_50 = output.action_fde_loss_50
+                                # action_fde_loss_79 = output.action_fde_loss_79
+
                                 # loss = ce_loss
                                 loss = ce_loss + action_loss
+                                # loss = ce_loss + action_loss + action_fde_loss_79 * 0.001 + action_fde_loss_50 * 0.001 + action_fde_loss_30 * 0.001
 
                                 # loss = action_loss
 
@@ -316,6 +323,12 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 #     progress = max(0.0, min(1.0, progress))
                                 #     action_loss_weight_scale = 1e-3 + progress * (1 - 1e-3)
                                 #     loss = action_loss * action_loss_weight_scale + ce_loss
+                            elif train_config.vec_emb_model:
+                                output = model(map_payloads=batch['map_payloads'],
+                                             trajectory_payloads=batch['trajectory_payloads'],
+                                             pred_seq=batch['pred_seq'],
+                                             loss_horizon=80)
+                                loss = output.action_prediction_loss
                             else:
                                 loss = model(**batch).loss
 
@@ -389,6 +402,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         #         print(f"Step {step}, Param: {name}, Grad Mean: {grad_mean.item():.6f}")
                         #     else:
                         #         print(f"Step {step}, Param: {name}, Grad is None")
+                        # breakpoint()
 
                         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                             if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
@@ -434,6 +448,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 'train/action_loss': action_loss.detach().float(),
                                 'train/ce_loss': ce_loss.detach().float(),
                                 'train/vec_order_loss': vec_order_loss.detach().float(),
+                                # 'train/action_fde_loss_30': action_fde_loss_30.detach().float(),
+                                # 'train/action_fde_loss_50': action_fde_loss_50.detach().float(),
+                                # 'train/action_fde_loss_79': action_fde_loss_79.detach().float(),
                             })
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
 
@@ -670,6 +687,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
         action_loss = 0.0
         ce_loss = 0.0
         vec_order_loss = 0.0
+        action_fde_loss_30 = 0.0
+        action_fde_loss_50 = 0.0
+        action_fde_loss_79 = 0.0
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
             sid = batch.pop("sid", None)
@@ -681,6 +701,8 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                     print("max eval steps reached, stopping evaluation, total_eval_steps: ", total_eval_steps - 1)
                 break
             for key in batch.keys():
+                if train_config.vec_emb_model:
+                    break # skip moving to device for vec emb model
                 if train_config.enable_fsdp:
                     if batch[key] is None:
                         continue
@@ -782,7 +804,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         action_loss += output.action_prediction_loss
                         ce_loss += output.cross_entropy_loss
                         vec_order_loss += output.vec_order_loss
-                    elif train_config.bidirectional_attention and not train_config.action_head:
+                    elif train_config.bidirectional_attention and not train_config.action_head and not train_config.vec_emb_model:
                         mask_type_labels = batch["labels"].clone()
                         mask_type_labels = torch.where(mask_type_labels == -100,
                                                        torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
@@ -801,11 +823,20 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         random_tensor = torch.rand(batch["labels"].shape, device=batch["labels"].device)
                         mask_positions = (random_tensor < masking_prob) & target_mask
                         batch["input_ids"][mask_positions] = mask_id
-                        output = model(**batch, tokenizer=tokenizer, task='action')
+                        output = model(**batch, tokenizer=tokenizer, task='action', use_fde_loss=False)
                         action_loss += output.action_prediction_loss
                         ce_loss += output.cross_entropy_loss
                         vec_order_loss += output.vec_order_loss
+                        # action_fde_loss_30 += output.action_fde_loss_30
+                        # action_fde_loss_50 += output.action_fde_loss_50
+                        # action_fde_loss_79 += output.action_fde_loss_79
 
+                        loss = output.action_prediction_loss
+                    elif train_config.vec_emb_model:
+                        output = model(map_payloads=batch['map_payloads'],
+                                     trajectory_payloads=batch['trajectory_payloads'],
+                                     pred_seq=batch['pred_seq'],
+                                     loss_horizon=80)
                         loss = output.action_prediction_loss
                     else:
                         loss = model(**batch).loss
@@ -848,6 +879,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
             dist.all_reduce(action_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(ce_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(vec_order_loss, op=dist.ReduceOp.SUM)
+            # dist.all_reduce(action_fde_loss_30, op=dist.ReduceOp.SUM)
+            # dist.all_reduce(action_fde_loss_50, op=dist.ReduceOp.SUM)
+            # dist.all_reduce(action_fde_loss_79, op=dist.ReduceOp.SUM)
 
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / len(eval_dataloader)
@@ -858,6 +892,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
         action_loss = action_loss / len(eval_dataloader)
         ce_loss = ce_loss / len(eval_dataloader)
         vec_order_loss = vec_order_loss / len(eval_dataloader)
+        # action_fde_loss_30 = action_fde_loss_30 / len(eval_dataloader)
+        # action_fde_loss_50 = action_fde_loss_50 / len(eval_dataloader)
+        # action_fde_loss_79 = action_fde_loss_79 / len(eval_dataloader)
 
     if train_config.enable_fsdp:
         eval_epoch_loss = eval_epoch_loss/world_size
@@ -868,6 +905,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
             action_loss = action_loss / world_size
             ce_loss = ce_loss / world_size
             vec_order_loss = vec_order_loss / world_size
+            # action_fde_loss_30 = action_fde_loss_30 / world_size
+            # action_fde_loss_50 = action_fde_loss_50 / world_size
+            # action_fde_loss_79 = action_fde_loss_79 / world_size
 
     if train_config.action_head:
         eval_ppl = torch.exp(ce_loss)
@@ -910,6 +950,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                 'eval/action_loss': action_loss.detach().float(),
                 'eval/ce_loss': ce_loss.detach().float(),
                 'eval/vec_order_loss': vec_order_loss.detach().float(),
+                # 'eval/action_fde_loss_30': action_fde_loss_30.detach().float(),
+                # 'eval/action_fde_loss_50': action_fde_loss_50.detach().float(),
+                # 'eval/action_fde_loss_79': action_fde_loss_79.detach().float(),
             }, commit=False)
 
     return eval_ppl, eval_epoch_loss, val_step_loss, val_step_perplexity

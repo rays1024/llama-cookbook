@@ -17,6 +17,7 @@ from accelerate.utils import is_xpu_available
 from llama_cookbook.inference.model_utils import load_model, load_peft_model
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
 from llama_cookbook.utils.bidirection_attn_llama import LlamaForBidirectionAttn
+from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
 from transformers import AutoConfig
 
 from llama_cookbook.inference.safety_utils import AgentType, get_safety_checker
@@ -307,8 +308,10 @@ def main(
     # model.to(device)
 
     device = "cuda" if torch.cuda.is_available() else "xpu" if is_xpu_available() else "cpu"
-    model = LlamaForBidirectionAttn.from_pretrained(model_name)
+    # model = LlamaForBidirectionAttn.from_pretrained(model_name)
+    model = LlamaForBidirectionAttnWithActions.from_pretrained(model_name)
     model.to(device)
+    
     
     if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
         print(
@@ -349,7 +352,7 @@ def main(
             outputs = model.generate(
                 **batch,
                 # max_new_tokens=max_new_tokens,
-                max_new_tokens=len(batch['labels'][0]),
+                max_new_tokens=80,
                 do_sample=do_sample,
                 top_p=top_p,
                 temperature=temperature,
@@ -509,8 +512,8 @@ def main(
     # data_path = "/p/ruishen/processed_waymo_data/validation/centroid_to_token.parquet"
 
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq.parquet"
-    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True.parquet"
-    data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_5hz_all_vec_with_seq_norm_True.parquet"
+    data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_5hz_all_vec_with_seq_norm_True.parquet"
 
     # custom_dataset = datasets.Dataset.from_parquet(data_path)
 
@@ -522,7 +525,7 @@ def main(
     num_rows = 1000
 
     # Step 2: Use tqdm to visualize loading progress
-    batch_size = 100
+    batch_size = 500
     rows = []
     for i in tqdm(range(0, num_rows, batch_size), desc="Building dataset"):
         batch = table.slice(i, batch_size)
@@ -537,7 +540,7 @@ def main(
     # Shuffle the dataset and select a batch of samples
     import random
     seed = 42
-    num_samples = min(100, len(custom_dataset))
+    num_samples = min(500, len(custom_dataset))
     random_rows = custom_dataset.shuffle(seed=seed)[:num_samples]
     batch_size = 1
 

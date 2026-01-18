@@ -24,24 +24,7 @@ class LlamaForBidirectionAttnWithActions(LlamaForCausalLMWithActions):
         super().__init__(config)
         self.model = LlamaModelBidirectional(config)
         self.tie_weights()
-        self._rebuild_parallel_action_head()
         self._align_action_head_dtype()
-
-    def _rebuild_parallel_action_head(self) -> None:
-        """
-        Rebuild the action decoder to consume the entire sequence worth of hidden
-        states (flattened) and emit a flattened action sequence.
-        """
-        flattened_input_dim = int(self._action_input_dim * self.horizon)
-        flattened_output_dim = int(self._action_dim * self.horizon)
-        self.action_decoder = self._build_action_decoder(
-            input_dim=flattened_input_dim,
-            hidden_dim=self._action_hidden_dim,
-            num_layers=self._action_num_layers,
-            action_dim=flattened_output_dim,
-        )
-        self.reset_action_head_parameters()
-        self.config.action_head_output_dim = self._action_dim
 
     def _input_ids_to_embeds_with_empty_tokens(self, input_ids: torch.LongTensor) -> torch.FloatTensor:
         """
@@ -114,7 +97,7 @@ class LlamaForBidirectionAttnWithActions(LlamaForCausalLMWithActions):
 
     def _decode_action_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
         """
-        Flatten all token embeddings and decode to a full action sequence in one shot.
+        Decode each token embedding independently and return a full action sequence.
         """
         batch_size, seq_len, hidden_dim = embeddings.size()
         if seq_len != self.horizon:
@@ -122,15 +105,8 @@ class LlamaForBidirectionAttnWithActions(LlamaForCausalLMWithActions):
                 f"Sequence length ({seq_len}) must equal action horizon ({self.horizon}) "
                 "when using parallel action decoding."
             )
-        flattened = embeddings.reshape(batch_size, seq_len * hidden_dim)
-        decoded = self.action_decoder(flattened)
-
-        expected_dim = seq_len * self._action_dim
-        if decoded.size(-1) != expected_dim:
-            raise ValueError(
-                f"Action decoder output dim mismatch: expected {expected_dim}, got {decoded.size(-1)}. "
-                "Ensure the action decoder is configured for flattened sequence output."
-            )
+        reshaped = embeddings.reshape(batch_size * seq_len, hidden_dim)
+        decoded = self.action_decoder(reshaped)
         return decoded.reshape(batch_size, seq_len, self._action_dim)
 
     @torch.no_grad()
@@ -290,7 +266,7 @@ class LlamaForBidirectionAttnWithActions(LlamaForCausalLMWithActions):
         **forward_kwargs,
     ):
         """
-        Parallel action decoding: runs one forward pass and decodes all action tokens at once.
+        Parallel action decoding: runs one forward pass and decodes each action token per step.
         """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided to generate actions.")

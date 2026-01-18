@@ -68,6 +68,7 @@ from transformers.models.mllama.modeling_mllama import (
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
 from llama_cookbook.utils.bidirection_attn_llama import LlamaForBidirectionAttn
 from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
+from llama_cookbook.utils.vector_embedding_model import LlamaForBidirectionAttnWithVectorEmbeddings
 
 def setup_wandb(train_config, fsdp_config, **kwargs):
     try:
@@ -158,7 +159,7 @@ def main(**kwargs):
     config.use_action_head = action_head_enabled
     if use_cache is not None:
         config.use_cache = use_cache
-    if action_head_enabled:
+    if action_head_enabled or train_config.vec_emb_model:
         config.action_head_output_dim = getattr(
             train_config, "action_head_output_dim", 4
         )
@@ -197,10 +198,12 @@ def main(**kwargs):
         is_vision = False
         if action_head_enabled and not train_config.bidirectional_attention:
             model_cls = LlamaForCausalLMWithActions
-        elif train_config.bidirectional_attention and not action_head_enabled:
+        elif train_config.bidirectional_attention and not action_head_enabled and not train_config.vec_emb_model:
             model_cls = LlamaForBidirectionAttn
         elif train_config.bidirectional_attention and action_head_enabled:
             model_cls = LlamaForBidirectionAttnWithActions
+        elif train_config.vec_emb_model and train_config.bidirectional_attention:
+            model_cls = LlamaForBidirectionAttnWithVectorEmbeddings
         else:
             model_cls = LlamaForCausalLM
         model_loading_kwargs = dict(
@@ -223,6 +226,9 @@ def main(**kwargs):
         ):
             model.reset_action_head_parameters()
             print("-> Action head parameters reinitialized (untrained_action_head=True).")
+        if train_config.vec_emb_model:
+            model.reset_action_head_parameters()
+            model.vector_encoder.reset_parameters()
         
     else:
         raise ValueError(
@@ -406,6 +412,7 @@ def main(**kwargs):
     # tokenizer.model_input_names = ['input_ids_a', 'labels_a', 'attention_mask_a', 'context_ids_b', 'gt_ids_b', 'prompt_ids_b']
     # tokenizer.model_input_names = ['input_ids', 'labels', 'attention_mask', 'identifier']
     tokenizer.model_input_names = ['input_ids', 'labels', 'attention_mask', 'raw_traj']
+    # tokenizer.model_input_names = ['sid_agent_id', 'map', 'trajectories', 'pred_seq']
 
     # If there is a mismatch between tokenizer vocab size and embedding matrix,
     # throw a warning and then expand the embedding matrix
