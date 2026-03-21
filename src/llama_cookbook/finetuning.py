@@ -69,6 +69,7 @@ from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
 from llama_cookbook.utils.bidirection_attn_llama import LlamaForBidirectionAttn
 from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
 from llama_cookbook.utils.vector_embedding_model import LlamaForBidirectionAttnWithVectorEmbeddings
+from llama_cookbook.utils.bidirection_diffusion_model import LlamaForBidirectionAttnWithDiffusionActions
 
 def setup_wandb(train_config, fsdp_config, **kwargs):
     try:
@@ -172,6 +173,9 @@ def main(**kwargs):
         config.action_head_horizon = max(
             int(getattr(train_config, "action_head_horizon", 79)), 1
         )
+        config.action_chunk_size = max(
+            int(getattr(train_config, "action_chunk_size", 1)), 1
+        )
 
     if config.model_type == "mllama":
         is_vision = True
@@ -198,12 +202,16 @@ def main(**kwargs):
         is_vision = False
         if action_head_enabled and not train_config.bidirectional_attention:
             model_cls = LlamaForCausalLMWithActions
-        elif train_config.bidirectional_attention and not action_head_enabled and not train_config.vec_emb_model:
-            model_cls = LlamaForBidirectionAttn
-        elif train_config.bidirectional_attention and action_head_enabled:
-            model_cls = LlamaForBidirectionAttnWithActions
-        elif train_config.vec_emb_model and train_config.bidirectional_attention:
-            model_cls = LlamaForBidirectionAttnWithVectorEmbeddings
+        elif train_config.bidirectional_attention:
+            if not action_head_enabled and not train_config.vec_emb_model:
+                model_cls = LlamaForBidirectionAttn
+            elif train_config.vec_emb_model:
+                model_cls = LlamaForBidirectionAttnWithVectorEmbeddings
+            elif action_head_enabled:
+                if train_config.action_model_type == "default":
+                    model_cls = LlamaForBidirectionAttnWithActions
+                elif train_config.action_model_type == "diffusion":
+                    model_cls = LlamaForBidirectionAttnWithDiffusionActions
         else:
             model_cls = LlamaForCausalLM
         model_loading_kwargs = dict(
@@ -402,6 +410,10 @@ def main(**kwargs):
     custom_tokens.append('MAP_END')
     custom_tokens.append('ROAD_START')
     custom_tokens.append('ROAD_END')
+
+
+    # only for straight line tokens
+    custom_tokens.extend([f"STRAIGHT_{i}" for i in range(30)])
 
     tokenizer.add_tokens(custom_tokens)
 

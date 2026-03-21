@@ -18,6 +18,7 @@ from transformers import (
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
 from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
 from llama_cookbook.utils.vector_embedding_model import LlamaForBidirectionAttnWithVectorEmbeddings
+from llama_cookbook.utils.bidirection_diffusion_model import LlamaForBidirectionAttnWithDiffusionActions
 
 
 # Function to load the main model for text generation
@@ -65,17 +66,26 @@ def load_llama_from_config(config_path, **config_overrides):
     if config.model_type == "mllama":
         model = MllamaForConditionalGeneration(config=config)
     elif config.model_type == "llama":
-        use_action_head = bool(getattr(config, "use_action_head", False))
+        use_action_head = getattr(config, "use_action_head", False)
         if not use_action_head:
-            for attr in ("action_head_output_dim", "action_head_hidden_dim", "action_head_num_layers"):
+            for attr in (
+                "action_head_output_dim",
+                "action_head_hidden_dim",
+                "action_head_num_layers",
+                "action_chunk_size",
+            ):
                 if hasattr(config, attr):
                     use_action_head = True
                     break
-        if use_action_head and not bool(getattr(config, "bidirectional_attention", False)):
+
+        if use_action_head and not getattr(config, "bidirectional_attention", False):
             model = LlamaForCausalLMWithActions(config=config)
-        elif use_action_head and bool(getattr(config, "bidirectional_attention", False)) and not bool(getattr(config, "vec_emb_model", False)):
-            model = LlamaForBidirectionAttnWithActions(config=config)
-        elif bool(getattr(config, "vec_emb_model", False)):
+        elif use_action_head and getattr(config, "bidirectional_attention", False) and not getattr(config, "vec_emb_model", False):
+            if getattr(config, "action_model_type", "default") == "diffusion":
+                model = LlamaForBidirectionAttnWithDiffusionActions(config=config)
+            else:
+                model = LlamaForBidirectionAttnWithActions(config=config)
+        elif getattr(config, "vec_emb_model", False):
             model = LlamaForBidirectionAttnWithVectorEmbeddings(config=config)
         else:
             model = LlamaForCausalLM(config=config)

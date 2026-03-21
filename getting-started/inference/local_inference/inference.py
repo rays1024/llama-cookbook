@@ -100,11 +100,19 @@ def save_attention_to_jsonl(
             entry['idx_weight_dict'] = idx_weight_dict
             f.write(json.dumps(entry) + '\n')
 
+def extract_goal_positions_as_list_string(text: str) -> str:  # remove later
+    pattern = r"Future 30th step position:\s*###(.*?)###,\s*50th step position:\s*###(.*?)###,\s*80th step position:\s*###(.*?)###\.?"  # remove later
+    match = re.search(pattern, text, flags=re.DOTALL)  # remove later
+    if match is None:  # remove later
+        return text  # remove later
+    goal_positions = [item.strip() for item in match.groups()]  # remove later
+    return str(goal_positions)  # remove later
+
 def main(
     model_name,
     peft_model: str = None,
     quantization: str = None, # Options: 4bit, 8bit
-    max_new_tokens: int = 100,  # The maximum numbers of tokens to generate
+    max_new_tokens: int = 820,  # The maximum numbers of tokens to generate
     prompt_file: str = None,
     seed: int = 42,  # seed value for reproducibility
     do_sample: bool = True,  # Whether or not to use sampling ; use greedy decoding otherwise.
@@ -289,6 +297,8 @@ def main(
     custom_tokens.append('ROAD_START')
     custom_tokens.append('ROAD_END')
 
+    custom_tokens.extend([f"STRAIGHT_{i}" for i in range(30)])
+
     tokenizer.add_tokens(custom_tokens)
 
     output_file = "inference_result.jsonl"
@@ -298,8 +308,8 @@ def main(
     if os.path.exists(attention_file):
         os.remove(attention_file)
 
-    # model = load_model(model_name, quantization, use_fast_kernels, **kwargs)
-    # device = model.device
+    model = load_model(model_name, quantization, use_fast_kernels, **kwargs)
+    device = model.device
     
     # device = "cuda" if torch.cuda.is_available() else "cpu"
     # config = AutoConfig.from_pretrained(model_name)
@@ -307,10 +317,10 @@ def main(
     # model = LlamaForCausalLMWithActions.from_pretrained(model_name, config=config)
     # model.to(device)
 
-    device = "cuda" if torch.cuda.is_available() else "xpu" if is_xpu_available() else "cpu"
-    # model = LlamaForBidirectionAttn.from_pretrained(model_name)
-    model = LlamaForBidirectionAttnWithActions.from_pretrained(model_name)
-    model.to(device)
+    # device = "cuda" if torch.cuda.is_available() else "xpu" if is_xpu_available() else "cpu"
+    # # model = LlamaForBidirectionAttn.from_pretrained(model_name)
+    # model = LlamaForBidirectionAttnWithActions.from_pretrained(model_name)
+    # model.to(device)
     
     
     if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
@@ -332,6 +342,7 @@ def main(
         top_p,
         top_k,
         max_new_tokens,
+        num_return_sequences: int = 1,
         **kwargs,
     ):
 
@@ -348,11 +359,12 @@ def main(
         else:
             batch = {k: v.to("cuda") for k, v in batch.items()}
 
+        breakpoint()
+
         with torch.no_grad():
             outputs = model.generate(
                 **batch,
-                # max_new_tokens=max_new_tokens,
-                max_new_tokens=80,
+                max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
                 top_p=top_p,
                 temperature=temperature,
@@ -364,6 +376,7 @@ def main(
                 # output_attentions=True,
                 output_scores=True,
                 return_dict_in_generate=True,
+                num_return_sequences=num_return_sequences,
                 pad_token_id=tokenizer.eos_token_id,
                 **kwargs,
             )
@@ -467,12 +480,19 @@ def main(
             list_of_tokens.append(output_token[len_input_ids:].detach().cpu())
             input_ids = batch['input_ids'][0].tolist()
             extracted_content = tokenizer.decode(output_token[len_input_ids:], skip_special_tokens=True)
+            extracted_content = extract_goal_positions_as_list_string(extracted_content)  # remove later
             # context_tokens = tokenizer.decode(output_token[:len_input_ids], skip_special_tokens=True)
             context_tokens = tokenizer.decode(batch['input_ids'][0][:len_input_ids], skip_special_tokens=True)
             context_batch.append(context_tokens)
             # Check if the input tokens contain "EGO_TRAJ_START"
             llm_answer.append(extracted_content)
-            ground_truths.append(tokenizer.decode(batch['labels'][0][batch['labels'][0] != -100], skip_special_tokens=True))
+            ground_truths.append(extract_goal_positions_as_list_string(tokenizer.decode(batch['labels'][0][batch['labels'][0] != -100], skip_special_tokens=True)))  # remove later
+
+        if num_return_sequences > 1:
+            if sid_batch is not None:
+                sid_batch = [sid for sid in sid_batch for _ in range(num_return_sequences)]
+            if ego_id_batch is not None:
+                ego_id_batch = [ego_id for ego_id in ego_id_batch for _ in range(num_return_sequences)]
 
         save_to_jsonl(ground_truths, context_batch, llm_answer, output_file, sid_batch, ego_id_batch)
 
@@ -512,8 +532,12 @@ def main(
     # data_path = "/p/ruishen/processed_waymo_data/validation/centroid_to_token.parquet"
 
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq.parquet"
-    data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_10hz_all_vec_with_seq_norm_True.parquet"
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_5hz_all_vec_with_seq_norm_True.parquet"
+
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_prediction_10hz_all_vec_norm_True.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_conditioned_traj_prediction_token_10hz_all_vec_norm_True.parquet"
+    data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_conditioned_traj_prediction_text_10hz_all_vec_norm_True.parquet"
 
     # custom_dataset = datasets.Dataset.from_parquet(data_path)
 
@@ -525,7 +549,7 @@ def main(
     num_rows = 1000
 
     # Step 2: Use tqdm to visualize loading progress
-    batch_size = 500
+    batch_size = 1000
     rows = []
     for i in tqdm(range(0, num_rows, batch_size), desc="Building dataset"):
         batch = table.slice(i, batch_size)
@@ -540,7 +564,7 @@ def main(
     # Shuffle the dataset and select a batch of samples
     import random
     seed = 42
-    num_samples = min(500, len(custom_dataset))
+    num_samples = min(100, len(custom_dataset))
     random_rows = custom_dataset.shuffle(seed=seed)[:num_samples]
     batch_size = 1
 
@@ -560,10 +584,10 @@ def main(
         # lower_batch = []
         # context_batch = []
 
-        # sid = random_rows['sid'][i]
-        # ego_id = random_rows['ego_id'][i]
+        sid = random_rows['sid'][i]
+        ego_id = random_rows['ego_id'][i]
 
-        # if (sid != "31f399e2d204e06b" or int(ego_id) != 1256) and (sid != "e3e18f8786bf9121" or int(ego_id) != 681) and (sid != "f657cdbf992acd32" or int(ego_id) != 705):
+        # if (sid != "e822a1b3522f2ce4" or int(ego_id) != 2277):
         #     continue
 
         # if sid != target_sid or int(ego_id) != target_ego_id:
@@ -836,19 +860,19 @@ def main(
         # )
 
 
-        input_ids_batch = random_rows['input_ids'][i:i+batch_size]
-        attention_mask_batch = random_rows['attention_mask'][i:i+batch_size]
+        # input_ids_batch = random_rows['input_ids'][i:i+batch_size]
+        # attention_mask_batch = random_rows['attention_mask'][i:i+batch_size]
         labels_batch = random_rows['labels'][i:i+batch_size]
 
-        input_ids_batch = torch.tensor(input_ids_batch, device=device)
-        attention_mask_batch = torch.tensor(attention_mask_batch, device=device)
+        # input_ids_batch = torch.tensor(input_ids_batch, device=device)
+        # attention_mask_batch = torch.tensor(attention_mask_batch, device=device)
         labels_batch = torch.tensor(labels_batch, device=device)
 
-        target_mask = labels_batch != -100
-        masking_id = -1
-        # mask input_ids where labels are -100
-        input_ids_batch = torch.where(target_mask, masking_id, input_ids_batch)
-        attention_mask_batch = torch.where(target_mask, 2, attention_mask_batch)
+        # target_mask = labels_batch != -100
+        # masking_id = -1
+        # # mask input_ids where labels are -100
+        # input_ids_batch = torch.where(target_mask, masking_id, input_ids_batch)
+        # attention_mask_batch = torch.where(target_mask, 2, attention_mask_batch)
 
         # Create the batch dictionary
         batch = {
@@ -867,8 +891,8 @@ def main(
             # 'context_batch': context_batch
         }
 
-        for i in range(6):
-            inference(batch, temperature, top_p, top_k, max_new_tokens, **kwargs)
+        num_return_sequences = 6
+        inference(batch, temperature, top_p, top_k, max_new_tokens, num_return_sequences=num_return_sequences, **kwargs)
 
         # if sid == target_sid and int(ego_id) == target_ego_id:
         #     exit()

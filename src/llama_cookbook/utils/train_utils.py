@@ -22,7 +22,7 @@ import json
 from llama_cookbook.model_checkpointing import save_fsdp_model_checkpoint_full, save_model_and_optimizer_sharded, save_optimizer_checkpoint, save_peft_checkpoint, save_model_checkpoint
 from llama_cookbook.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_cookbook.utils.memory_utils import MemoryTrace
-from llama_cookbook.utils.aux_loss import ade_loss, ce_loss_by_type, ade_loss_all_vec, multi_class_ce
+from llama_cookbook.utils.aux_loss import ade_loss, ce_loss_by_type, ade_loss_all_vec, multi_label_bce_loss
 from accelerate.utils import is_xpu_available, is_ccl_available
 from llama_cookbook.utils.flop_utils import FlopMeasure
 import torch.nn as nn
@@ -124,6 +124,10 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     #     ah_trainable = False
     #     start_cotrain_step = len(train_dataloader) * 3/4
     steps_per_epoch = len(train_dataloader)
+
+    past_val_losses = []
+    masking_prob = 0.6
+    last_change_step = 0
     # Start the training loop
     for epoch in range(train_config.num_epochs):
         print(f"Starting epoch {epoch}/{train_config.num_epochs}")
@@ -157,7 +161,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             else:
                                 if batch[key] is None:
                                     continue
-                                if key == "pred_seq":
+                                if key in ["pred_seq", "multi_label", "label_weight"]:
                                     batch[key] = torch.tensor(batch[key])
                                 batch[key] = batch[key].to(local_rank)
                         else:
@@ -166,7 +170,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             elif torch.cuda.is_available():
                                 if batch[key] is None:
                                     continue
-                                if key == "pred_seq":
+                                if key in ["pred_seq", "multi_label", "label_weight"]:
                                     batch[key] = torch.tensor(batch[key])
                                 batch[key] = batch[key].to('cuda:0')
                     with autocast():
@@ -272,7 +276,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                                                 torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
                                 batch["mask_type_labels"] = mask_type_labels
                                 loss = model(**batch, tokenizer=tokenizer).loss
-                            elif train_config.bidirectional_attention and train_config.action_head:
+                            elif train_config.bidirectional_attention and train_config.action_head and train_config.action_model_type == "default":
                                 mask_type_labels = batch["labels"].clone()
                                 mask_type_labels = torch.where(mask_type_labels == -100,
                                                                torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
@@ -280,16 +284,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 batch["mask_type_labels"] = mask_type_labels
 
                                 if train_config.target_masking_schedule:
-                                    # progress = total_train_steps/(len(train_dataloader) * 4)
-                                    # masking_prob = min(1.0, progress)
-
-                                    total_steps = steps_per_epoch * 4
-                                    progress = total_train_steps / total_steps  # 0 → 1 over 4 epochs
-
-                                    num_steps = 6  # 0.5 to 1.0 in increments of 0.1
-                                    step_index = int(progress * num_steps)
-
-                                    masking_prob = min(1.0, 0.5 + 0.1 * step_index)
+                                    if len(past_val_losses) == 0:
+                                        masking_prob = 0.6
                                 else:
                                     masking_prob = 1.0
                                 mask_id = -1
@@ -298,37 +294,69 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 mask_positions = (random_tensor < masking_prob) & target_mask
                                 batch["input_ids"][mask_positions] = mask_id
 
-                                output = model(**batch, tokenizer=tokenizer, task='action', use_fde_loss=False)
+                                output = model(**batch, tokenizer=tokenizer, task='action', loss_type='ade')
                                 loss = output.loss
                                 action_loss = output.action_prediction_loss
+                                smoothness_loss = output.smoothness_loss
                                 ce_loss = output.cross_entropy_loss
                                 vec_order_loss = output.vec_order_loss
 
-                                # action_fde_loss_30 = output.action_fde_loss_30
-                                # action_fde_loss_50 = output.action_fde_loss_50
-                                # action_fde_loss_79 = output.action_fde_loss_79
+                                if train_config.multi_label_bce:
+                                    mlbce_loss = multi_label_bce_loss(
+                                        output.logits,
+                                        batch["labels"],
+                                        batch["multi_label"],
+                                        batch["label_weight"],
+                                        tokenizer=tokenizer,
+                                        ignore_index=-100,
+                                    )
+                                    loss = mlbce_loss + action_loss
 
                                 # loss = ce_loss
-                                loss = ce_loss + action_loss
-                                # loss = ce_loss + action_loss + action_fde_loss_79 * 0.001 + action_fde_loss_50 * 0.001 + action_fde_loss_30 * 0.001
+                                # loss = ce_loss + action_loss
+                                loss = action_loss
 
-                                # loss = action_loss
+                                # loss = action_loss + smoothness_loss * 1000
+                            elif train_config.bidirectional_attention and train_config.action_head and train_config.action_model_type == "diffusion":
+                                mask_type_labels = batch["labels"].clone()
+                                mask_type_labels = torch.where(mask_type_labels == -100,
+                                                               torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
+                                                                torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
+                                batch["mask_type_labels"] = mask_type_labels
 
-                                # if total_train_steps <= (len(train_dataloader) * 1/2):
-                                #     loss = ce_loss
-                                # elif total_train_steps <= (len(train_dataloader) * 3/4):
-                                #     loss = action_loss
-                                # elif (total_train_steps - start_cotrain_step) / (len(train_dataloader) * 0.5) <= 1.0:
-                                #     progress = (step + epoch * len(train_dataloader) - start_cotrain_step) / (len(train_dataloader) * 0.5)
-                                #     progress = max(0.0, min(1.0, progress))
-                                #     action_loss_weight_scale = 1e-3 + progress * (1 - 1e-3)
-                                #     loss = action_loss * action_loss_weight_scale + ce_loss
+                                if train_config.target_masking_schedule:
+                                    if len(past_val_losses) == 0:
+                                        masking_prob = 0.6
+                                else:
+                                    masking_prob = 1.0
+                                mask_id = -1
+                                target_mask = batch["labels"] != -100
+                                random_tensor = torch.rand(batch["labels"].shape, device=batch["labels"].device)
+                                mask_positions = (random_tensor < masking_prob) & target_mask
+                                batch["input_ids"][mask_positions] = mask_id
+
+                                output = model(**batch, tokenizer=tokenizer, task='action')
+                                loss = output.action_loss
+
                             elif train_config.vec_emb_model:
                                 output = model(map_payloads=batch['map_payloads'],
                                              trajectory_payloads=batch['trajectory_payloads'],
                                              pred_seq=batch['pred_seq'],
                                              loss_horizon=80)
                                 loss = output.action_prediction_loss
+                            elif train_config.multi_label_bce:
+                                outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                                logits = outputs.logits
+                                mlbce_loss = multi_label_bce_loss(
+                                    logits,
+                                    batch["labels"],
+                                    batch["multi_label"],
+                                    batch["label_weight"],
+                                    tokenizer=tokenizer,
+                                    ignore_index=-100,
+                                )
+                                loss = mlbce_loss
+
                             else:
                                 loss = model(**batch).loss
 
@@ -448,9 +476,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 'train/action_loss': action_loss.detach().float(),
                                 'train/ce_loss': ce_loss.detach().float(),
                                 'train/vec_order_loss': vec_order_loss.detach().float(),
-                                # 'train/action_fde_loss_30': action_fde_loss_30.detach().float(),
-                                # 'train/action_fde_loss_50': action_fde_loss_50.detach().float(),
-                                # 'train/action_fde_loss_79': action_fde_loss_79.detach().float(),
+                                'train/masking_prob': masking_prob,
+                                # 'train/ml_bce_loss': mlbce_loss.detach().float() if 'mlbce_loss' in locals() else 0.0,
+                                'train/smoothness_loss': smoothness_loss.detach().float() if smoothness_loss is not None else 0.0,
                             })
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
 
@@ -486,9 +514,36 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     #         model.set_language_model_trainable(True)
                     #         llm_trainable = True
 
-                    if (step + epoch * len(train_dataloader)) % 1000 == 0 and step > 0:
+                    if (step + epoch * len(train_dataloader)) % 2500 == 0 and step > 0:
                         # run evaluation and save model
                         eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
+                        past_val_losses.append(eval_epoch_loss)
+
+
+                        if train_config.target_masking_schedule:
+                            window_size = 4
+                            min_history = window_size * 2
+                            margin = 1.2
+
+                            if len(past_val_losses) >= min_history:
+                                recent = torch.tensor(past_val_losses[-window_size:])
+                                older  = torch.tensor(past_val_losses[-min_history:-window_size])
+
+                                recent_mean = recent.mean()
+                                older_mean = older.mean()
+
+                                # estimate noise from recent history
+                                noise = torch.std(recent)
+
+                                # estimate trend magnitude
+                                trend = (recent_mean - older_mean).abs()
+
+                                if trend < noise * margin:
+                                    if len(past_val_losses) - last_change_step >= window_size:
+                                        masking_prob = min(1.0, masking_prob + 0.1)
+                                        last_change_step = len(past_val_losses)
+
+
                         print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
                         print("=====================================================")
                         folder_name = (
@@ -549,6 +604,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         should_save_model = train_config.save_model
         if train_config.run_validation:
             eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
+            past_val_losses.append(eval_epoch_loss)
             if train_config.save_metrics:
                 val_step_loss.extend(temp_val_loss)
                 val_step_perplexity.extend(temp_step_perplexity)
@@ -687,9 +743,8 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
         action_loss = 0.0
         ce_loss = 0.0
         vec_order_loss = 0.0
-        action_fde_loss_30 = 0.0
-        action_fde_loss_50 = 0.0
-        action_fde_loss_79 = 0.0
+        mlbce_loss = 0.0
+        smoothness_loss = 0.0
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
             sid = batch.pop("sid", None)
@@ -706,7 +761,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                 if train_config.enable_fsdp:
                     if batch[key] is None:
                         continue
-                    if key == "pred_seq":
+                    if key in ["pred_seq", "multi_label", "label_weight"]:
                         batch[key] = torch.tensor(batch[key])
                     batch[key] = batch[key].to(local_rank)
                 else:
@@ -715,7 +770,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                     else:
                         if batch[key] is None:
                             continue
-                        if key == "pred_seq":
+                        if key in ["pred_seq", "multi_label", "label_weight"]:
                             batch[key] = torch.tensor(batch[key])
                         batch[key] = batch[key].to('cuda:0')
             # Ensure no gradients are computed for this scope to save memory
@@ -811,7 +866,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                                                         torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
                         batch["mask_type_labels"] = mask_type_labels
                         loss = model(**batch, tokenizer=tokenizer).loss
-                    elif train_config.bidirectional_attention and train_config.action_head:
+                    elif train_config.bidirectional_attention and train_config.action_head and train_config.action_model_type == "default":
                         mask_type_labels = batch["labels"].clone()
                         mask_type_labels = torch.where(mask_type_labels == -100,
                                                         torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
@@ -823,21 +878,59 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         random_tensor = torch.rand(batch["labels"].shape, device=batch["labels"].device)
                         mask_positions = (random_tensor < masking_prob) & target_mask
                         batch["input_ids"][mask_positions] = mask_id
-                        output = model(**batch, tokenizer=tokenizer, task='action', use_fde_loss=False)
+                        output = model(**batch, tokenizer=tokenizer, task='action', loss_type='ade')
                         action_loss += output.action_prediction_loss
                         ce_loss += output.cross_entropy_loss
                         vec_order_loss += output.vec_order_loss
-                        # action_fde_loss_30 += output.action_fde_loss_30
-                        # action_fde_loss_50 += output.action_fde_loss_50
-                        # action_fde_loss_79 += output.action_fde_loss_79
 
+                        smoothness_loss += output.smoothness_loss
                         loss = output.action_prediction_loss
+
+                        if train_config.multi_label_bce:
+                            logits = output.logits
+                            mlbce_loss += multi_label_bce_loss(
+                                logits,
+                                batch["labels"],
+                                batch["multi_label"],
+                                batch["label_weight"],
+                                tokenizer=tokenizer,
+                                ignore_index=-100,
+                            )
+                    elif train_config.bidirectional_attention and train_config.action_head and train_config.action_model_type == "diffusion":
+                        mask_type_labels = batch["labels"].clone()
+                        mask_type_labels = torch.where(mask_type_labels == -100,
+                                                        torch.tensor(1, device=mask_type_labels.device, dtype=mask_type_labels.dtype),
+                                                        torch.tensor(2, device=mask_type_labels.device, dtype=mask_type_labels.dtype)) 
+                        batch["mask_type_labels"] = mask_type_labels
+
+                        masking_prob = 1.0
+                        mask_id = -1
+                        target_mask = batch["labels"] != -100
+                        random_tensor = torch.rand(batch["labels"].shape, device=batch["labels"].device)
+                        mask_positions = (random_tensor < masking_prob) & target_mask
+                        batch["input_ids"][mask_positions] = mask_id
+
+                        output = model(**batch, tokenizer=tokenizer, task='action')
+                        loss = output.action_loss
+
                     elif train_config.vec_emb_model:
                         output = model(map_payloads=batch['map_payloads'],
                                      trajectory_payloads=batch['trajectory_payloads'],
                                      pred_seq=batch['pred_seq'],
                                      loss_horizon=80)
                         loss = output.action_prediction_loss
+                    elif train_config.multi_label_bce:
+                        output = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                        logits = output.logits
+                        mlbce_loss = multi_label_bce_loss(
+                            logits,
+                            batch["labels"],
+                            batch["multi_label"],
+                            batch["label_weight"],
+                            tokenizer=tokenizer,
+                            ignore_index=-100,
+                        )
+                        loss = mlbce_loss
                     else:
                         loss = model(**batch).loss
                         # if train_config.get("multi_class_ce", False):
@@ -875,41 +968,37 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
     if torch.cuda.device_count() > 1 and train_config.enable_fsdp:
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
-        if train_config.action_head:
+        if train_config.action_head and isinstance(action_loss, torch.Tensor):
             dist.all_reduce(action_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(ce_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(vec_order_loss, op=dist.ReduceOp.SUM)
-            # dist.all_reduce(action_fde_loss_30, op=dist.ReduceOp.SUM)
-            # dist.all_reduce(action_fde_loss_50, op=dist.ReduceOp.SUM)
-            # dist.all_reduce(action_fde_loss_79, op=dist.ReduceOp.SUM)
+            # dist.all_reduce(mlbce_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(smoothness_loss, op=dist.ReduceOp.SUM)
 
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / len(eval_dataloader)
-    if train_config.action_head:
+    if train_config.action_head and isinstance(action_loss, torch.Tensor):
         eval_ade = eval_ade / len(eval_dataloader)
         eval_ce = eval_ce / len(eval_dataloader)
         eval_aux_loss = eval_aux_loss / len(eval_dataloader)
         action_loss = action_loss / len(eval_dataloader)
         ce_loss = ce_loss / len(eval_dataloader)
         vec_order_loss = vec_order_loss / len(eval_dataloader)
-        # action_fde_loss_30 = action_fde_loss_30 / len(eval_dataloader)
-        # action_fde_loss_50 = action_fde_loss_50 / len(eval_dataloader)
-        # action_fde_loss_79 = action_fde_loss_79 / len(eval_dataloader)
-
+        # mlbce_loss = mlbce_loss / len(eval_dataloader)
+        smoothness_loss = smoothness_loss / len(eval_dataloader)
     if train_config.enable_fsdp:
         eval_epoch_loss = eval_epoch_loss/world_size
-        if train_config.action_head:
+        if train_config.action_head and isinstance(action_loss, torch.Tensor):
             eval_ade = eval_ade / world_size
             eval_ce = eval_ce / world_size
             eval_aux_loss = eval_aux_loss / world_size
             action_loss = action_loss / world_size
             ce_loss = ce_loss / world_size
             vec_order_loss = vec_order_loss / world_size
-            # action_fde_loss_30 = action_fde_loss_30 / world_size
-            # action_fde_loss_50 = action_fde_loss_50 / world_size
-            # action_fde_loss_79 = action_fde_loss_79 / world_size
+            # mlbce_loss = mlbce_loss / world_size
+            smoothness_loss = smoothness_loss / world_size
 
-    if train_config.action_head:
+    if train_config.action_head and isinstance(action_loss, torch.Tensor):
         eval_ppl = torch.exp(ce_loss)
     else:
         eval_ppl = torch.exp(eval_epoch_loss)
@@ -947,12 +1036,11 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
             }, commit=False)
         if "action_loss" in locals() and "ce_loss" in locals():
             wandb_run.log({
-                'eval/action_loss': action_loss.detach().float(),
-                'eval/ce_loss': ce_loss.detach().float(),
-                'eval/vec_order_loss': vec_order_loss.detach().float(),
-                # 'eval/action_fde_loss_30': action_fde_loss_30.detach().float(),
-                # 'eval/action_fde_loss_50': action_fde_loss_50.detach().float(),
-                # 'eval/action_fde_loss_79': action_fde_loss_79.detach().float(),
+                'eval/action_loss': action_loss.detach().float() if isinstance(action_loss, torch.Tensor) else 0.0,
+                'eval/ce_loss': ce_loss.detach().float() if isinstance(ce_loss, torch.Tensor) else 0.0,
+                'eval/vec_order_loss': vec_order_loss.detach().float() if isinstance(vec_order_loss, torch.Tensor) else 0.0,
+                # 'eval/ml_bce_loss': mlbce_loss.detach().float() if 'mlbce_loss' in locals() else 0.0,
+                'eval/smoothness_loss': smoothness_loss.detach().float() if isinstance(smoothness_loss, torch.Tensor) else 0.0,
             }, commit=False)
 
     return eval_ppl, eval_epoch_loss, val_step_loss, val_step_perplexity

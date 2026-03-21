@@ -14,6 +14,7 @@ from datasets import Dataset
 
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
 from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
+from llama_cookbook.utils.bidirection_diffusion_model import LlamaForBidirectionAttnWithDiffusionActions
 
 from tqdm import tqdm  # Add tqdm import
 
@@ -100,6 +101,8 @@ def main() -> None:
     # model = LlamaForCausalLMWithActions.from_pretrained(args.model_path, config=config)
     config.bidirectional_attention = True
     model = LlamaForBidirectionAttnWithActions.from_pretrained(args.model_path, config=config)
+    # model = LlamaForBidirectionAttnWithDiffusionActions.from_pretrained(args.model_path, config=config)
+
     model.to(device)
     model.eval()
 
@@ -271,10 +274,10 @@ def main() -> None:
     table = pq.read_table(args.input_parquet)
 
     num_rows = table.num_rows
-    num_rows = 100
+    num_rows = 1000
 
     # Step 2: Use tqdm to visualize loading progress
-    batch_size = 10
+    batch_size = 1000
     rows = []
     for i in tqdm(range(0, num_rows, batch_size), desc="Building dataset"):
         batch = table.slice(i, batch_size)
@@ -318,6 +321,42 @@ def main() -> None:
                 pred_seq = _to_tensor(row_pred_seq, device=device).unsqueeze(0)
 
             with torch.no_grad():
+                if getattr(model, "_use_mon", False):
+                    mask_type_labels = row_labels.copy()
+                    mask_type_labels = _to_tensor(mask_type_labels, dtype=torch.long, device=device).unsqueeze(0)
+                    mask_type_labels = torch.where(mask_type_labels == -100, 1, 2)
+
+                    target_mask = (mask_type_labels == 2).long()
+                    mask_id = -1
+                    mon_input_ids = torch.where(target_mask == 1, mask_id, input_ids)
+
+                    mon_action_output, _ = model.action_head_based_generate_actions(
+                        input_ids=mon_input_ids,
+                        attention_mask=attention_mask,
+                        return_generation_output=True,
+                        pad_token_id=tokenizer.pad_token_id,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        do_sample=True,
+                        tokenizer=tokenizer,
+                        max_new_tokens=args.max_new_tokens,
+                        mask_type_labels=mask_type_labels,
+                    )
+
+                    mon_action_output = mon_action_output.detach().cpu()
+                    mon_action_batch = mon_action_output.reshape(mon_action_output.size(0), -1, 2).numpy()
+                    for mon_candidate_idx, mon_candidate in enumerate(mon_action_batch):
+                        json_line = {
+                            "ground_truth": row_pred_seq.tolist() if row_pred_seq is not None else None,
+                            "llm_answer": mon_candidate.tolist(),
+                            "mon_candidate_idx": mon_candidate_idx,
+                            "sid": row_sid,
+                            "ego_id": row_ego_id,
+                            "decoded_text": None,
+                        }
+                        f.write(json.dumps(json_line) + "\n")
+                    continue
+
                 for _ in range(args.num_runs):
                     # train_input_ids = _to_tensor(row["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
                     # train_attention_mask = _to_tensor(row.get("attention_mask", None), dtype=torch.long, device=device)

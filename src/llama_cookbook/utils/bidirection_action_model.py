@@ -100,14 +100,19 @@ class LlamaForBidirectionAttnWithActions(LlamaForCausalLMWithActions):
         Decode each token embedding independently and return a full action sequence.
         """
         batch_size, seq_len, hidden_dim = embeddings.size()
-        if seq_len != self.horizon:
+        required_tokens = getattr(self, "_action_token_count", self.horizon)
+        if seq_len != required_tokens:
             raise ValueError(
-                f"Sequence length ({seq_len}) must equal action horizon ({self.horizon}) "
+                f"Sequence length ({seq_len}) must equal action token count ({required_tokens}) "
                 "when using parallel action decoding."
             )
         reshaped = embeddings.reshape(batch_size * seq_len, hidden_dim)
         decoded = self.action_decoder(reshaped)
-        return decoded.reshape(batch_size, seq_len, self._action_dim)
+        decoded = decoded.reshape(batch_size, seq_len, self._action_chunk_size, self._action_dim)
+        actions = decoded.reshape(batch_size, seq_len * self._action_chunk_size, self._action_dim)
+        if actions.size(1) > self.horizon:
+            actions = actions[:, : self.horizon, :]
+        return actions
 
     @torch.no_grad()
     def generate(
@@ -267,6 +272,8 @@ class LlamaForBidirectionAttnWithActions(LlamaForCausalLMWithActions):
     ):
         """
         Parallel action decoding: runs one forward pass and decodes each action token per step.
+        When MoN is enabled, returns all MoN candidates as an expanded batch:
+        (batch * mon_num_samples, horizon * action_dim).
         """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided to generate actions.")
@@ -297,6 +304,32 @@ class LlamaForBidirectionAttnWithActions(LlamaForCausalLMWithActions):
         flattened_actions = outputs.action_head_output
         if flattened_actions is None:
             raise RuntimeError("Action head did not produce any output during generation.")
+        if self._use_mon:
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states is None or len(hidden_states) == 0:
+                raise RuntimeError("MoN generation requires hidden states from forward().")
+            final_hidden = hidden_states[-1]
+            if not isinstance(final_hidden, torch.Tensor):
+                raise RuntimeError("Unexpected hidden-state format for MoN generation.")
+
+            action_embeddings = self._select_action_token_embeddings(
+                hidden_states=final_hidden,
+                attention_mask=attention_mask,
+                labels=None,
+            )
+            sampled_embeddings = self._sample_mon_action_embeddings(action_embeddings)
+            sample_count, batch_size, token_count, hidden_dim = sampled_embeddings.size()
+            sampled_embeddings = sampled_embeddings.reshape(
+                sample_count * batch_size,
+                token_count,
+                hidden_dim,
+            )
+            sampled_actions = self._decode_action_embeddings(sampled_embeddings)
+            flattened_actions = sampled_actions.reshape(sample_count, batch_size, -1).permute(1, 0, 2).reshape(
+                batch_size * sample_count,
+                -1,
+            )
+            outputs["mon_num_samples"] = sample_count
 
         action_dim = self._action_dim
         predicted_steps = flattened_actions.size(1) // action_dim if action_dim > 0 else 0

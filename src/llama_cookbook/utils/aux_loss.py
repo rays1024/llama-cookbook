@@ -51,6 +51,182 @@ train_start_heading = json.load(open(train_start_heading_path, 'r'))
 
 combined_start_heading = {**train_start_heading, **val_start_heading}
 
+def multi_label_bce_loss(
+    logits,
+    labels,
+    multi_label,
+    label_weight=None,
+    tokenizer=None,
+    ignore_index=-100,
+    reduction="mean",
+    pos_weight=100.0,
+):
+    B, T, V = logits.size()
+    shifted_logits = logits[..., :-1, :].contiguous()
+    shifted_labels = labels[..., 1:].contiguous()
+
+    logits_flat = shifted_logits.view(-1, V)
+    labels_flat = shifted_labels.view(-1)
+    valid_mask = labels_flat != ignore_index
+    valid_count = int(valid_mask.sum().item())
+    if valid_count == 0:
+        return torch.tensor(0.0, device=logits.device)
+
+    if tokenizer is not None:
+        cached_id = getattr(multi_label_bce_loss, "_vec_tokenizer_id", None)
+        if not hasattr(multi_label_bce_loss, "vec_token_ids") or cached_id != id(tokenizer):
+            vec_tokens = tokenizer.convert_tokens_to_ids([f"VEC_{i}" for i in range(1024)])
+            vec_token_ids = torch.tensor(vec_tokens, dtype=torch.long)
+            vec_token_ids = vec_token_ids[vec_token_ids >= 0]
+            if vec_token_ids.numel() == 0:
+                raise ValueError("No VEC_* tokens found in tokenizer.")
+            multi_label_bce_loss.vec_token_ids = vec_token_ids
+            multi_label_bce_loss._vec_tokenizer_id = id(tokenizer)
+    if not hasattr(multi_label_bce_loss, "vec_token_ids"):
+        raise ValueError("tokenizer is required to cache VEC_* token ids.")
+    vec_token_ids = multi_label_bce_loss.vec_token_ids.to(device=logits.device)
+
+    if torch.is_tensor(multi_label):
+        multi_label = multi_label.to(device=logits.device)
+    if label_weight is not None and torch.is_tensor(label_weight):
+        label_weight = label_weight.to(device=logits.device, dtype=logits.dtype)
+
+    if multi_label is not None and multi_label.dim() == 3:
+        if multi_label.size(0) != B:
+            raise ValueError("multi_label batch size does not match logits.")
+        if multi_label.size(1) == labels.size(1):
+            multi_label = multi_label[:, 1:, :]
+            if label_weight is not None and label_weight.dim() == 3 and label_weight.size(1) == labels.size(1):
+                label_weight = label_weight[:, 1:, :]
+        if multi_label.size(1) == labels.size(1) - 1:
+            multi_label_flat = multi_label.reshape(-1, multi_label.size(-1))[valid_mask]
+            if label_weight is None:
+                label_weight_flat = torch.ones_like(multi_label_flat, dtype=logits.dtype)
+            else:
+                label_weight_flat = label_weight.reshape(-1, label_weight.size(-1))[valid_mask]
+        else:
+            valid_per_sample = (shifted_labels != ignore_index).sum(dim=1).tolist()
+            valid_full_per_sample = (labels != ignore_index).sum(dim=1).tolist()
+            first_label_valid = (labels[:, 0] != ignore_index).tolist()
+            multi_label_chunks = []
+            weight_chunks = []
+            for b in range(B):
+                count = valid_per_sample[b]
+                if count == 0:
+                    continue
+                start = 1 if valid_full_per_sample[b] == count + 1 and first_label_valid[b] else 0
+                multi_label_chunks.append(multi_label[b, start:start + count, :])
+                if label_weight is not None:
+                    weight_chunks.append(label_weight[b, start:start + count, :])
+            multi_label_flat = torch.cat(multi_label_chunks, dim=0) if multi_label_chunks else multi_label.new_empty((0, multi_label.size(-1)))
+            if label_weight is None:
+                label_weight_flat = torch.ones_like(multi_label_flat, dtype=logits.dtype)
+            else:
+                label_weight_flat = torch.cat(weight_chunks, dim=0) if weight_chunks else label_weight.new_empty((0, label_weight.size(-1)))
+    elif multi_label is not None and multi_label.dim() == 2:
+        if multi_label.size(0) != valid_count:
+            raise ValueError("multi_label length does not match the number of valid labels.")
+        multi_label_flat = multi_label
+        if label_weight is None:
+            label_weight_flat = torch.ones_like(multi_label_flat, dtype=logits.dtype)
+        else:
+            label_weight_flat = label_weight
+    else:
+        if not isinstance(multi_label, (list, tuple)) or len(multi_label) != B:
+            raise ValueError("multi_label must be a tensor or a list with batch length.")
+        if label_weight is not None and (not isinstance(label_weight, (list, tuple)) or len(label_weight) != B):
+            raise ValueError("label_weight must be a tensor or a list with batch length.")
+        valid_per_sample = (shifted_labels != ignore_index).sum(dim=1).tolist()
+        valid_full_per_sample = (labels != ignore_index).sum(dim=1).tolist()
+        first_label_valid = (labels[:, 0] != ignore_index).tolist()
+        multi_label_flat_list = []
+        label_weight_flat_list = []
+        for b in range(B):
+            sample_multi = list(multi_label[b])
+            sample_weight = list(label_weight[b]) if label_weight is not None else None
+            if len(sample_multi) == valid_full_per_sample[b] and first_label_valid[b]:
+                sample_multi = sample_multi[1:]
+                if sample_weight is not None:
+                    sample_weight = sample_weight[1:]
+            if len(sample_multi) < valid_per_sample[b]:
+                raise ValueError("multi_label is shorter than the number of valid labels.")
+            if len(sample_multi) > valid_per_sample[b]:
+                sample_multi = sample_multi[:valid_per_sample[b]]
+                if sample_weight is not None:
+                    sample_weight = sample_weight[:valid_per_sample[b]]
+            multi_label_flat_list.extend(sample_multi)
+            if sample_weight is not None:
+                label_weight_flat_list.extend(sample_weight)
+        multi_label_flat = torch.as_tensor(multi_label_flat_list, device=logits.device, dtype=torch.long)
+        if label_weight is None:
+            label_weight_flat = torch.ones_like(multi_label_flat, dtype=logits.dtype)
+        else:
+            label_weight_flat = torch.as_tensor(label_weight_flat_list, device=logits.device, dtype=logits.dtype)
+
+    if multi_label_flat.size(0) != valid_count:
+        raise ValueError("multi_label does not align with the number of valid labels after shifting.")
+
+    valid_logits = logits_flat[valid_mask]
+    valid_labels = labels_flat[valid_mask]
+
+    vec_vocab_mask = torch.zeros(V, dtype=torch.bool, device=logits.device)
+    vec_vocab_mask[vec_token_ids] = True
+    non_vec_mask = ~vec_vocab_mask
+    vec_target_mask = vec_vocab_mask[valid_labels]
+
+    # BCE #1: classify whether the target token is VEC_* or non-VEC.
+    if non_vec_mask.any():
+        vec_group_logits = torch.logsumexp(valid_logits[:, vec_vocab_mask], dim=1)
+        non_vec_group_logits = torch.logsumexp(valid_logits[:, non_vec_mask], dim=1)
+        type_logits = vec_group_logits - non_vec_group_logits
+        type_targets = vec_vocab_mask[valid_labels].to(dtype=logits.dtype)
+        type_loss = F.binary_cross_entropy_with_logits(type_logits, type_targets, reduction="none")
+    else:
+        type_loss = torch.zeros(valid_count, device=logits.device, dtype=logits.dtype)
+
+    # BCE #2: multi-label BCE over VEC_* tokens only.
+    pos_mask = multi_label_flat != ignore_index
+    safe_indices = multi_label_flat.clone()
+    safe_indices[~pos_mask] = 0
+    pos_is_vec = pos_mask & vec_vocab_mask[safe_indices]
+
+    pos_logits = valid_logits.gather(dim=1, index=safe_indices)
+    pos_logsig = F.logsigmoid(pos_logits)
+    pos_weights = label_weight_flat * pos_is_vec.to(label_weight_flat.dtype)
+    pos_loss = -(pos_weights * pos_logsig).sum(dim=1)
+    pos_loss = pos_loss * float(pos_weight)
+
+    vec_logits = valid_logits[:, vec_token_ids]
+    neg_logsig = -F.logsigmoid(-vec_logits)
+
+    vec_index = torch.full((V,), -1, dtype=torch.long, device=logits.device)
+    vec_index[vec_token_ids] = torch.arange(vec_token_ids.numel(), device=logits.device)
+    pos_vec_indices = vec_index[safe_indices]
+    pos_vec_indices = pos_vec_indices.masked_fill(~pos_is_vec, -1)
+    valid_pos = pos_vec_indices >= 0
+    if valid_pos.any():
+        pos_vec_counts = torch.zeros((valid_count, vec_token_ids.numel()), dtype=torch.int32, device=logits.device)
+        pos_vec_counts.scatter_add_(1, pos_vec_indices.clamp_min(0), valid_pos.int())
+        pos_vec_mask = pos_vec_counts > 0
+    else:
+        pos_vec_mask = torch.zeros((valid_count, vec_token_ids.numel()), dtype=torch.bool, device=logits.device)
+
+    neg_mask = ~pos_vec_mask
+    neg_loss = (neg_logsig * neg_mask.to(neg_logsig.dtype)).sum(dim=1)
+
+    pos_loss = pos_loss * vec_target_mask.to(pos_loss.dtype)
+    neg_loss = neg_loss * vec_target_mask.to(neg_loss.dtype)
+
+    total_loss = type_loss + pos_loss + neg_loss
+    if reduction == "sum":
+        return total_loss.sum()
+    if reduction == "none":
+        output = torch.zeros_like(labels_flat, dtype=total_loss.dtype)
+        output[valid_mask] = total_loss
+        return output.view(B, T - 1)
+    return total_loss.sum() / valid_count
+    
+
 def ce_loss_by_type(logits, labels, tokenizer, ignore_index=-100, reduction="mean"):
     """
     Cross-entropy loss with separate handling for trajectory tokens (VEC_, LEN_, POS_)
@@ -167,160 +343,6 @@ def log_normalize_with_target(ade, target_good=0.001, good_max=1.0):
     # Log1p to compress large ADE, normalize so good_max maps near 1
     norm = torch.log1p(rel) / torch.log1p(torch.tensor(good_max / target_good))
     return norm
-
-# def ade_loss(logits, top_k, sid, ego_id, weight=1.0, tokenizer=None, labels=None):
-#     global angle_bins, combined_start_heading
-
-#     if not hasattr(ade_loss, 'vec_token_ids'):
-#         vocab = tokenizer.get_vocab()
-#         ade_loss.vec_token_ids = set(tok_id for tok, tok_id in vocab.items() if tok.startswith("VEC_"))
-#         ade_loss.len_token_ids = set(tok_id for tok, tok_id in vocab.items() if tok.startswith("LEN_"))
-#         ade_loss.pos_token_ids = set(tok_id for tok, tok_id in vocab.items() if tok.startswith("POS_"))
-#         ade_loss.traj_token_ids = torch.tensor(list((ade_loss.vec_token_ids | ade_loss.len_token_ids | ade_loss.pos_token_ids)), device=logits.device)
-#         ade_loss.vec_token_ids = torch.tensor(list(ade_loss.vec_token_ids), device=logits.device)
-#         ade_loss.len_token_ids = torch.tensor(list(ade_loss.len_token_ids), device=logits.device)
-
-#         ade_loss.vec_to_angle, ade_loss.len_to_length = build_vec_len_lookup(tokenizer, device=logits.device, dtype=logits.dtype)
-#         ade_loss.angle_bins_tensor = torch.tensor(angle_bins, device=logits.device, dtype=logits.dtype)
-
-#     # Shift logits and labels so they are aligned
-#     logits_shifted = logits[..., :-1, :].contiguous()
-#     labels_shifted = labels[..., 1:].contiguous()
-#     vals, idx = torch.topk(logits_shifted, top_k, dim=-1)
-#     probs = torch.softmax(vals, dim=-1)
-#     B, T, K = probs.shape
-
-#     # Precompute all trajectory tensors for the batch
-#     norm_raw_traj_tensors = []
-#     for b in range(B):
-#         raw_traj, _ = load_trajectory_by_key_from_memory(sid[b], ego_id[b])
-#         norm_raw_traj = raw_traj - raw_traj[0]
-#         norm_raw_traj = norm_raw_traj[9:]
-#         norm_raw_traj_tensor = torch.as_tensor(norm_raw_traj, device=logits.device, dtype=logits.dtype)
-#         norm_raw_traj_tensors.append(norm_raw_traj_tensor)
-
-#     ade_values = []
-#     label_vec_mask = torch.isin(labels_shifted, ade_loss.vec_token_ids)
-#     label_len_mask = torch.isin(labels_shifted, ade_loss.len_token_ids)
-
-#     # logits_flat = logits_shifted.view(-1, logits_shifted.size(-1))
-#     # labels_flat = labels_shifted.view(-1)
-
-#     # ce_flat = F.cross_entropy(
-#     #     logits_flat,
-#     #     labels_flat,
-#     #     ignore_index=-100,
-#     #     reduction="none"
-#     # )
-#     # ce_loss = ce_flat.view(B, T)
-
-#     # def get_weighted_ce_loss():
-#     #     vec_ids = torch.tensor(list(ade_loss.vec_token_ids), device=idx.device)
-#     #     len_ids = torch.tensor(list(ade_loss.len_token_ids), device=idx.device)
-
-#     #     is_vec_pred = torch.isin(idx, vec_ids)   # (B, T, K)
-#     #     is_len_pred = torch.isin(idx, len_ids)   # (B, T, K)
-
-#     #     vec_counts = is_vec_pred.sum(dim=-1)     # (B, T)
-#     #     len_counts = is_len_pred.sum(dim=-1)     # (B, T)
-
-#     #     vec_ratio = vec_counts.float() / idx.size(-1)
-#     #     len_ratio = len_counts.float() / idx.size(-1)
-
-#     #     weights = (label_vec_mask * vec_ratio) + (label_len_mask * len_ratio)
-#     #     weighted_ce_loss = ce_loss * weights
-
-#     #     return weighted_ce_loss
-
-#     # masked_ce_loss = get_weighted_ce_loss()
-#     # ce_penalty = masked_ce_loss.sum() / (masked_ce_loss != 0).sum().clamp(min=1.0)
-
-#     vec_ade_values = []
-#     len_ade_values = []
-#     for b in range(B):
-#         next_token_ade = []
-#         vec_token_ade = []
-#         vec_step_count = 1
-#         len_step_count = 1
-#         for t in range(T):
-#             if labels_shifted[b, t] == -100:
-#                 continue
-
-#             vec_mask = [i for i in range(K) if idx[b, t, i].item() in ade_loss.vec_token_ids]
-#             len_mask = [i for i in range(K) if idx[b, t, i].item() in ade_loss.len_token_ids]
-
-#             if not label_vec_mask[b, t] and not label_len_mask[b, t]:
-#                 continue
-
-#             if not (
-#                 (len(vec_mask) > 0 and label_vec_mask[b, t]) or
-#                 (len(len_mask) > 0 and label_len_mask[b, t])
-#             ):
-#                 continue
-
-#             start_heading = combined_start_heading[f"{sid[b]}__{ego_id[b]}"][1]
-#             if label_vec_mask[b, t]:
-#                 if vec_step_count == len(norm_raw_traj_tensors[b]):
-#                     continue
-#                 p_vec = probs[b, t, vec_mask]
-#                 ids_vec = idx[b, t, vec_mask]
-#                 vec_angles = ade_loss.vec_to_angle[ids_vec]
-#                 len_lengths = torch.arange(0, 3.51, 0.01, device=logits.device, dtype=logits.dtype)
-#                 try:
-#                     ego_headings_vec = start_heading + ade_loss.angle_bins_tensor[vec_angles]
-#                 except (IndexError, RuntimeError):
-#                     continue
-#                 cos_headings = torch.cos(ego_headings_vec)[:, None]
-#                 sin_headings = torch.sin(ego_headings_vec)[:, None]
-#                 dx = len_lengths[None, :] * cos_headings
-#                 dy = len_lengths[None, :] * sin_headings
-#                 pos = torch.stack([dx, dy], dim=-1)
-#                 target = norm_raw_traj_tensors[b][vec_step_count] - norm_raw_traj_tensors[b][vec_step_count - 1]
-#                 diff = pos - target
-#                 norm_diff = torch.norm(diff, dim=-1)
-#                 min_diff = torch.min(norm_diff, dim=1).values
-#                 step_ade = (p_vec * min_diff).sum()
-#                 vec_token_ade.append(step_ade)
-#                 vec_ade_values.append(step_ade.item())
-#                 vec_step_count += 1
-
-#             elif label_len_mask[b, t]:
-#                 if len_step_count == len(norm_raw_traj_tensors[b]):
-#                     continue
-#                 p_len = probs[b, t, len_mask]
-#                 ids_len = idx[b, t, len_mask]
-#                 len_lengths = ade_loss.len_to_length[ids_len]
-#                 len_gt = ade_loss.len_to_length[labels_shifted[b, t].item()]
-#                 len_diff = torch.abs(len_lengths - len_gt)
-#                 step_ade = (p_len * len_diff).sum()
-#                 next_token_ade.append(step_ade)
-#                 len_ade_values.append(step_ade.item())
-#                 len_step_count += 1
-
-#         if vec_token_ade:
-#             weight_start = 1.0
-#             weight_end = 3.0
-#             if len(vec_token_ade) > 30:
-#                 step_start = 30
-#                 step_end = min(80, len(vec_token_ade))
-#                 for svw in range(step_start, step_end):
-#                     w = weight_start + (weight_end - weight_start) * (svw - step_start) / (80 - step_start)
-#                     vec_token_ade[svw] *= w
-#             next_token_ade.extend(vec_token_ade)
-
-#         if next_token_ade:
-#             ade_values.append(sum(next_token_ade) / len(next_token_ade))
-
-#     if ade_values:
-#         ade_value = torch.stack(ade_values).sum()
-#     else:
-#         ade_value = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-
-#     vec_ade = np.mean(vec_ade_values) if vec_ade_values else 0.0
-#     len_ade = np.mean(len_ade_values) if len_ade_values else 0.0
-#     # aux_loss = ade_value + ce_penalty
-#     aux_loss = ade_value
-#     return aux_loss, ade_value, {"vec_ade": vec_ade, "len_ade": len_ade}
     
 def ade_loss(logits, top_k, sid, ego_id, weight=1.0, tokenizer=None, labels=None):
     device = logits.device

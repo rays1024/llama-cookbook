@@ -9,6 +9,7 @@ import pyarrow as pa
 import tqdm
 import psutil
 import os
+import warnings
 from datasets import Dataset, concatenate_datasets
 
 process = psutil.Process(os.getpid())
@@ -79,13 +80,66 @@ class CustomDataCollator:
 
 
 def get_data_collator(dataset_processer, dataset_config):
-    if "embedding" in dataset_config.data_path:
+    if "embedding" in dataset_config.train_path:
         return CustomDataCollator()
     else:
         return None
 
 def mem_gb():
     return process.memory_info().rss / (1024 ** 3)
+
+
+def _build_dataset_direct(parquet_file, keep_cols, num_rows):
+    table = parquet_file.read(columns=keep_cols).slice(0, num_rows)
+    return Dataset(table)
+
+
+def _empty_dataset_from_schema(parquet_file, keep_cols):
+    schema = parquet_file.schema_arrow
+    empty_arrays = [pa.array([], type=schema.field(col).type) for col in keep_cols]
+    return Dataset(pa.Table.from_arrays(empty_arrays, names=keep_cols))
+
+
+def _build_dataset_batched(parquet_file, keep_cols, num_rows, batch_size=1024):
+    if num_rows == 0:
+        return _empty_dataset_from_schema(parquet_file, keep_cols)
+
+    datasets_buffer = []
+    processed_rows = 0
+
+    pbar = tqdm.tqdm(
+        parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols),
+        total=(num_rows + batch_size - 1) // batch_size if num_rows else 0,
+        desc="Building dataset (batched fallback)",
+    )
+
+    for record_batch in pbar:
+        if processed_rows >= num_rows:
+            break
+
+        remaining = num_rows - processed_rows
+        if record_batch.num_rows > remaining:
+            record_batch = record_batch.slice(0, remaining)
+
+        table = pa.Table.from_batches([record_batch])
+        datasets_buffer.append(Dataset(table))
+        processed_rows += record_batch.num_rows
+
+        pbar.set_postfix(rows=processed_rows, mem=f"{mem_gb():.2f} GB")
+
+    if datasets_buffer:
+        return datasets_buffer[0] if len(datasets_buffer) == 1 else concatenate_datasets(datasets_buffer)
+
+    return _empty_dataset_from_schema(parquet_file, keep_cols)
+
+
+def _build_dataset_pandas(data_path, keep_cols, num_rows):
+    import pandas as pd
+
+    df = pd.read_parquet(data_path, columns=keep_cols)
+    if num_rows is not None:
+        df = df.iloc[:num_rows]
+    return Dataset.from_pandas(df, preserve_index=False)
 
 def get_custom_dataset(dataset_config, tokenizer, split):
     # Load parquet file into dataset object
@@ -304,8 +358,28 @@ def get_custom_dataset(dataset_config, tokenizer, split):
 
 
     keep_cols = [name for name in parquet_file.schema_arrow.names if name not in DROP_COLUMNS]
-    table = parquet_file.read(columns=keep_cols).slice(0, num_rows)
+    if num_rows == 0:
+        return _empty_dataset_from_schema(parquet_file, keep_cols)
+    try:
+        dataset = _build_dataset_direct(parquet_file, keep_cols, num_rows)
+    except OSError as direct_err:
+        if "List index overflow" not in str(direct_err):
+            raise
 
-    dataset = Dataset(table)
+        warnings.warn(
+            f"Direct parquet read failed with '{direct_err}'. "
+            "Falling back to batched Arrow loading.",
+            RuntimeWarning,
+        )
+
+        try:
+            dataset = _build_dataset_batched(parquet_file, keep_cols, num_rows)
+        except Exception as batched_err:
+            warnings.warn(
+                f"Batched Arrow loading also failed with '{batched_err}'. "
+                "Falling back to pandas.read_parquet.",
+                RuntimeWarning,
+            )
+            dataset = _build_dataset_pandas(data_path, keep_cols, num_rows)
 
     return dataset

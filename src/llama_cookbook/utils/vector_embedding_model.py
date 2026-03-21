@@ -55,6 +55,7 @@ class PolylineVectorEncoder(nn.Module):
         self.normalize_positions = bool(getattr(config, "vector_encoder_normalize", True))
         self.output_scale = float(getattr(config, "vector_output_scale", 0.1))
         self.initializer_range = float(getattr(config, "initializer_range", 0.02))
+        self.use_abs_embed = bool(getattr(config, "vector_abs_embed", True))
 
         self.road_type_to_id = {name: idx for idx, name in enumerate(ROAD_TYPE_ORDER)}
         self.agent_type_to_id = {name: idx for idx, name in enumerate(AGENT_TYPE_ORDER)}
@@ -68,6 +69,15 @@ class PolylineVectorEncoder(nn.Module):
         self.vector_mlps = nn.ModuleList()
         self.post_mlp_norms = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(self.num_steps)])
         self.context_norm = nn.LayerNorm(hidden_size)
+        abs_feat_dim = 5  # center_x, center_y, scale, start_x, start_y
+        if self.use_abs_embed:
+            self.abs_mlp = nn.Sequential(
+                nn.Linear(abs_feat_dim, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+        else:
+            self.abs_mlp = None
         vector_input_dim = 4 + type_embed_dim
         for step in range(self.num_steps):
             step_input_dim = vector_input_dim if step == 0 else hidden_size * 2
@@ -135,8 +145,20 @@ class PolylineVectorEncoder(nn.Module):
             positions_tensor = positions_tensor[:, :2]
         elif positions_tensor.size(1) < 2:
             return None
+        raw_positions = positions_tensor
+        center = positions_tensor.mean(dim=0, keepdim=True)
+        centered = positions_tensor - center
+        scale = centered.abs().amax()
+        scale = torch.clamp(scale, min=1.0)
         if self.normalize_positions:
-            positions_tensor = self._normalize_positions(positions_tensor)
+            positions_tensor = centered / scale
+        abs_features = None
+        if self.use_abs_embed:
+            start = raw_positions[0]
+            abs_features = torch.cat(
+                [center.squeeze(0), scale.unsqueeze(0), start],
+                dim=0,
+            )
         starts = positions_tensor[:-1, :]
         ends = positions_tensor[1:, :]
 
@@ -150,17 +172,13 @@ class PolylineVectorEncoder(nn.Module):
         type_embed = type_embed.to(dtype=dtype)
         type_expand = type_embed.unsqueeze(0).expand(starts.size(0), -1)
         vector_features = torch.cat([starts, ends, type_expand], dim=-1)
-        return self._encode_vectors(vector_features)
+        return self._encode_vectors(vector_features, abs_features=abs_features)
 
-    def _normalize_positions(self, positions: torch.Tensor) -> torch.Tensor:
-        # Center and scale per polyline to keep inputs in a stable range.
-        center = positions.mean(dim=0, keepdim=True)
-        centered = positions - center
-        scale = centered.abs().amax()
-        scale = torch.clamp(scale, min=1.0)
-        return centered / scale
-
-    def _encode_vectors(self, vector_features: torch.Tensor) -> torch.Tensor:
+    def _encode_vectors(
+        self,
+        vector_features: torch.Tensor,
+        abs_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x = vector_features
         context = None
         for step, mlp in enumerate(self.vector_mlps):
@@ -173,6 +191,9 @@ class PolylineVectorEncoder(nn.Module):
                 x = torch.cat([x, context_expand], dim=-1)
         if self.output_scale != 1.0:
             context = context * self.output_scale
+        if abs_features is not None and self.abs_mlp is not None:
+            abs_embed = self.abs_mlp(abs_features.to(dtype=context.dtype))
+            context = context + abs_embed
         return context
 
 class LlamaForBidirectionAttnWithVectorEmbeddings(LlamaForBidirectionAttnWithActions):
@@ -192,10 +213,11 @@ class LlamaForBidirectionAttnWithVectorEmbeddings(LlamaForBidirectionAttnWithAct
             hidden_dim=self._action_hidden_dim * 4, # increase hidden dim for better capacity
             # hidden_dim=self._action_hidden_dim,
             num_layers=self._action_num_layers,
-            action_dim=self._action_dim,
+            action_dim=self._action_dim * self._action_chunk_size,
         )
         self.reset_action_head_parameters()
         self.config.action_head_output_dim = self._action_dim
+        self.config.action_chunk_size = self._action_chunk_size
 
     def forward(
         self,
@@ -276,11 +298,12 @@ class LlamaForBidirectionAttnWithVectorEmbeddings(LlamaForBidirectionAttnWithAct
         hidden_size = self.config.hidden_size
 
         padded = torch.zeros(batch_size, max_len, hidden_size, device=device, dtype=dtype)
-        attention_mask = torch.ones(batch_size, max_len, device=device, dtype=torch.long)
+        attention_mask = torch.zeros(batch_size, max_len, device=device, dtype=torch.long)
 
         for idx, sequence in enumerate(sequences):
             seq_len = sequence.size(0)
             padded[idx, :seq_len] = sequence
-            attention_mask[idx, seq_len:] = 2
+            attention_mask[idx, :seq_len] = 1
+            attention_mask[idx, seq_len-horizon:seq_len] = 2
 
         return padded, attention_mask

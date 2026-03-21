@@ -45,8 +45,17 @@ def main(
 
                 print(f"Model name: {HF_model_path_or_name}")
 
+                for key in data:
+                    if data[key] in ["True", "False"]:
+                        data[key] = data[key] == "True"
+                
                 if data.get("action_head", False) or any(
-                    key in data for key in ("action_head_output_dim", "action_head_hidden_dim", "action_head_num_layers")
+                    key in data for key in (
+                        "action_head_output_dim",
+                        "action_head_hidden_dim",
+                        "action_head_num_layers",
+                        "action_chunk_size",
+                    )
                 ) or data.get("vec_emb_model", False):
                     config_overrides["use_action_head"] = True
                     if "action_head_output_dim" in data:
@@ -57,10 +66,16 @@ def main(
                         config_overrides["action_head_num_layers"] = int(data["action_head_num_layers"])
                     if "action_head_horizon" in data:
                         config_overrides["action_head_horizon"] = int(data["action_head_horizon"])
+                    if "action_chunk_size" in data:
+                        config_overrides["action_chunk_size"] = int(data["action_chunk_size"])
+                    if "action_head_use_mon" in data:
+                        config_overrides["action_head_use_mon"] = data["action_head_use_mon"]
                 if data.get("bidirectional_attention", False):
                     config_overrides["bidirectional_attention"] = True
                 if data.get("vec_emb_model", False):
                     config_overrides["vec_emb_model"] = True
+                if data.get("action_model_type"):
+                    config_overrides["action_model_type"] = data["action_model_type"]
         except FileNotFoundError:
             print(f"The file {train_params_path} does not exist.")
             HF_model_path_or_name = input("Please enter the model name: ")
@@ -74,7 +89,8 @@ def main(
     model_def = load_llama_from_config(HF_model_path_or_name, **config_overrides)
     print("model is loaded from config")
     # extend the model embedding size to match the FSDP sharded model
-    model_def.resize_token_embeddings(129305) # hardcoded for now, if error, change accordingly
+    # model_def.resize_token_embeddings(129305) # hardcoded for now, if error, change accordingly
+    model_def.resize_token_embeddings(129335) # hardcoded for now, if error, change accordingly
     print("model embedding size is extended to match the FSDP sharded model")
     # load the FSDP sharded checkpoints into the model
     try:

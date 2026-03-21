@@ -2,7 +2,7 @@
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
 import dataclasses
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 import numpy as np
 
 import torch
@@ -36,10 +36,8 @@ class CausalLMOutputWithPastAndActions(CausalLMOutputWithPast):
     language_model_loss: Optional[torch.FloatTensor] = None
     cross_entropy_loss: Optional[torch.FloatTensor] = None
     action_prediction_loss: Optional[torch.FloatTensor] = None
+    smoothness_loss: Optional[torch.FloatTensor] = None
     vec_order_loss: Optional[torch.FloatTensor] = None
-    action_fde_loss_30: Optional[torch.FloatTensor] = None
-    action_fde_loss_50: Optional[torch.FloatTensor] = None
-    action_fde_loss_79: Optional[torch.FloatTensor] = None
 
 class MLPResNetBlock(nn.Module):
     """Residual MLP block with pre-layer normalization."""
@@ -86,6 +84,10 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         self.horizon = int(getattr(config, "action_head_horizon", 1))
         if self.horizon <= 0:
             raise ValueError("`action_head_horizon` must be a positive integer.")
+        self._action_chunk_size = int(getattr(config, "action_chunk_size", 1))
+        if self._action_chunk_size <= 0:
+            raise ValueError("`action_chunk_size` must be a positive integer.")
+        self._action_token_count = (self.horizon + self._action_chunk_size - 1) // self._action_chunk_size
 
         action_hidden_dim = int(getattr(config, "action_head_hidden_dim", config.hidden_size))
         action_num_layers = int(getattr(config, "action_head_num_layers", 2))
@@ -93,29 +95,42 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         self._action_dim = int(getattr(config, "action_head_output_dim", 2))
         if self._action_dim <= 0:
             raise ValueError("`action_head_output_dim` must be a positive integer.")
+        self._action_decoder_dim = self._action_dim * self._action_chunk_size
         self._action_hidden_dim = action_hidden_dim
         self._action_num_layers = action_num_layers
         self._action_input_dim = int(config.hidden_size)
         self._action_head_arch = str(getattr(config, "action_head_arch", "resnet")).lower() # resnet or mlp
+        self._use_mon = bool(getattr(config, "action_head_use_mon", getattr(config, "action_head_mon", False)))
+        configured_mon_samples = int(getattr(config, "action_head_mon_num_samples", 4))
+        if configured_mon_samples <= 0:
+            raise ValueError("`action_head_mon_num_samples` must be a positive integer.")
+        self._mon_num_samples = configured_mon_samples if self._use_mon else 1
+        self._mon_noise_std = float(getattr(config, "action_head_mon_noise_std", 0.5))
+        if self._mon_noise_std < 0:
+            raise ValueError("`action_head_mon_noise_std` must be non-negative.")
 
         self.action_decoder = self._build_action_decoder(
             input_dim=config.hidden_size,
             hidden_dim=action_hidden_dim,
             num_layers=action_num_layers,
-            action_dim=self._action_dim,
+            action_dim=self._action_decoder_dim,
         )
-
-        self.reset_action_head_parameters()
-        self.action_decoder.to(dtype=self.model.embed_tokens.weight.dtype,
-                            device=self.model.embed_tokens.weight.device)
+        self.action_decoder.to(
+            dtype=self.model.embed_tokens.weight.dtype,
+            device=self.model.embed_tokens.weight.device,
+        )
 
         self.config.action_head_output_dim = self._action_dim
         self.config.action_head_hidden_dim = action_hidden_dim
         self.config.action_head_num_layers = action_num_layers
         self.config.action_head_loss_type = self._default_loss_type
         self.config.action_head_horizon = self.horizon
+        self.config.action_chunk_size = self._action_chunk_size
         self.config.use_action_head = True
         self.config.action_head_arch = self._action_head_arch
+        self.config.action_head_use_mon = self._use_mon
+        self.config.action_head_mon_num_samples = self._mon_num_samples
+        self.config.action_head_mon_noise_std = self._mon_noise_std
         self.token_id_to_centroid = None
 
     def init_token_id_to_centroid(self, tokenizer):
@@ -156,13 +171,23 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
 
             # return nn.Linear(input_dim, action_dim, bias=False)
             
-            depth = max(num_layers, 4)
+            depth = max(num_layers, 12)
 
             # define layers explicitly
             fc1 = nn.Linear(input_dim, hidden_dim)
             fc2 = nn.Linear(hidden_dim, hidden_dim)
             fc3 = nn.Linear(hidden_dim, hidden_dim)
             fc4 = nn.Linear(hidden_dim, action_dim)
+
+            # fc5 = nn.Linear(input_dim, hidden_dim)
+            # fc6 = nn.Linear(hidden_dim, hidden_dim)
+            # fc7 = nn.Linear(hidden_dim, hidden_dim)
+            # fc8 = nn.Linear(hidden_dim, action_dim)
+            # fc9 = nn.Linear(input_dim, hidden_dim)
+            # fc10 = nn.Linear(hidden_dim, hidden_dim)
+            # fc11 = nn.Linear(hidden_dim, hidden_dim)
+            # fc12 = nn.Linear(hidden_dim, action_dim)
+            
 
             act = nn.SiLU()
 
@@ -190,6 +215,8 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             wrapper = _Wrapper()
             # register parameters manually so optimizer can see them
             wrapper.fc1, wrapper.fc2, wrapper.fc3, wrapper.fc4 = fc1, fc2, fc3, fc4
+            # wrapper.fc5, wrapper.fc6, wrapper.fc7, wrapper.fc8 = fc5, fc6, fc7, fc8
+            # wrapper.fc9, wrapper.fc10, wrapper.fc11, wrapper.fc12 = fc9, fc10, fc11, fc12
 
             return wrapper
 
@@ -364,18 +391,11 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         task: str = "language",
         loss_type: Optional[str] = None,
         loss_horizon: Optional[int] = None,
-        use_fde_loss: bool = False,
-        fde_loss_steps: Optional[Tuple[int, ...]] = None,
         pred_seq=None,
         use_ce_loss: bool = True,
         **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        if "use_fde_loss" in kwargs:
-            if not use_fde_loss:
-                use_fde_loss = kwargs.pop("use_fde_loss")
-            else:
-                kwargs.pop("use_fde_loss")
 
         if task == "language":
             effective_output_hidden_states = output_hidden_states or self.config.output_hidden_states
@@ -425,20 +445,60 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         flattened_actions = decoded_actions.reshape(decoded_actions.size(0), -1)
 
         action_loss = None
-        fde_losses = None
+        smoothness_loss = None
+        mon_sample_losses = None
+        selected_sample_index = 0
         if pred_seq is not None:
             effective_loss_type = (loss_type or self._default_loss_type).lower()
-            action_loss, fde_losses = self._compute_action_loss(
-                flattened_actions,
-                pred_seq,
-                effective_loss_type,
-                loss_horizon,
-                use_fde_loss=use_fde_loss,
-                fde_loss_steps=fde_loss_steps,
-            )
+            if self._use_mon:
+                sampled_embeddings = self._sample_mon_action_embeddings(action_embeddings)
+                sample_count, batch_size, token_count, hidden_dim = sampled_embeddings.size()
+                sampled_embeddings = sampled_embeddings.reshape(sample_count * batch_size, token_count, hidden_dim)
+                sampled_actions = self._decode_action_embeddings(sampled_embeddings)
+                flattened_actions_per_sample = sampled_actions.reshape(sample_count, batch_size, -1)
+
+                per_sample_action_losses = []
+                per_sample_smoothness_losses = []
+                per_sample_total_losses = []
+                for sample_actions in flattened_actions_per_sample:
+                    sample_action_loss, sample_smoothness_loss = self._compute_action_loss(
+                        sample_actions,
+                        pred_seq,
+                        effective_loss_type,
+                        loss_horizon,
+                    )
+                    per_sample_action_losses.append(sample_action_loss)
+                    per_sample_smoothness_losses.append(sample_smoothness_loss)
+
+                    sample_total_loss = sample_action_loss
+                    if sample_smoothness_loss is not None:
+                        sample_total_loss = sample_total_loss + sample_smoothness_loss.to(
+                            dtype=sample_total_loss.dtype
+                        )
+                    per_sample_total_losses.append(sample_total_loss)
+
+                mon_sample_losses = torch.stack(per_sample_total_losses)
+                selected_sample_index = int(torch.argmin(mon_sample_losses).item())
+                flattened_actions = flattened_actions_per_sample[selected_sample_index]
+                action_loss = per_sample_action_losses[selected_sample_index]
+                smoothness_loss = per_sample_smoothness_losses[selected_sample_index]
+            else:
+                action_loss, smoothness_loss = self._compute_action_loss(
+                    flattened_actions,
+                    pred_seq,
+                    effective_loss_type,
+                    loss_horizon,
+                )
 
         ce_loss = base_outputs.loss if (use_ce_loss and base_outputs.loss is not None) else None
         combined_loss = action_loss
+        if smoothness_loss is not None:
+            smoothness_component = smoothness_loss.to(
+                dtype=combined_loss.dtype if combined_loss is not None else smoothness_loss.dtype
+            )
+            combined_loss = (
+                smoothness_component if combined_loss is None else combined_loss + smoothness_component
+            )
         if ce_loss is not None:
             ce_loss = ce_loss.to(dtype=combined_loss.dtype if combined_loss is not None else ce_loss.dtype)
             combined_loss = ce_loss if combined_loss is None else combined_loss + ce_loss
@@ -448,7 +508,7 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
 
         action_outputs = CausalLMOutputWithPastAndActions(
             loss=combined_loss,
-            logits=None if task == "action" else base_outputs.logits,
+            logits=base_outputs.logits,
             past_key_values=base_outputs.past_key_values,
             hidden_states=(base_outputs.hidden_states if effective_output_hidden_states else None),
             attentions=base_outputs.attentions,
@@ -459,11 +519,11 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         action_outputs["language_model_loss"] = base_outputs.loss
         action_outputs["cross_entropy_loss"] = ce_loss
         action_outputs["action_prediction_loss"] = action_loss
-        if fde_losses is not None:
-            action_outputs["action_fde_loss_30"] = fde_losses.get("step_30")
-            action_outputs["action_fde_loss_50"] = fde_losses.get("step_50")
-            action_outputs["action_fde_loss_79"] = fde_losses.get("step_79")
+        action_outputs["smoothness_loss"] = smoothness_loss
         action_outputs["vec_order_loss"] = vec_order_loss
+        if self._use_mon and mon_sample_losses is not None:
+            action_outputs["mon_selected_sample"] = selected_sample_index
+            action_outputs["mon_sample_losses"] = mon_sample_losses
 
         if not return_dict:
             return tuple(value for value in action_outputs.values() if value is not None)
@@ -477,6 +537,7 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
     ) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.size()
         device = hidden_states.device
+        required_tokens = self._action_token_count
 
         if labels is not None:
             if labels.dim() != 2 or labels.size(0) != batch_size or labels.size(1) != seq_len:
@@ -485,24 +546,25 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
                 )
             label_mask = labels.ne(-100)
             valid_counts = label_mask.sum(dim=1)
-            if torch.any(valid_counts < self.horizon):
+            if torch.any(valid_counts < required_tokens):
                 raise ValueError(
-                    "Some sequences provide fewer labeled tokens than the configured action horizon. "
-                    f"Minimum labeled count: {int(valid_counts.min().item())}, required: {self.horizon}."
+                    "Some sequences provide fewer labeled tokens than the configured action token count. "
+                    f"Minimum labeled count: {int(valid_counts.min().item())}, required: {required_tokens}."
                 )
             positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
             masked_positions = positions.masked_fill(~label_mask, seq_len)
             sorted_positions, _ = torch.sort(masked_positions, dim=1)
-            select_positions = sorted_positions[:, : self.horizon]
+            select_positions = sorted_positions[:, : required_tokens]
             gather_positions = select_positions.unsqueeze(-1).expand(-1, -1, hidden_dim)
             return torch.gather(hidden_states, dim=1, index=gather_positions)
 
         if attention_mask is None:
-            if seq_len < self.horizon:
+            if seq_len < required_tokens:
                 raise ValueError(
-                    f"Sequence length ({seq_len}) must be at least the configured horizon ({self.horizon})."
+                    f"Sequence length ({seq_len}) must be at least the configured action token count "
+                    f"({required_tokens})."
                 )
-            return hidden_states[:, -self.horizon :, :]
+            return hidden_states[:, -required_tokens :, :]
 
         normalized_mask = self._normalize_attention_mask(
             attention_mask=attention_mask,
@@ -511,15 +573,15 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             device=device,
         )
         valid_lengths = normalized_mask.sum(dim=1)
-        if torch.any(valid_lengths < self.horizon):
+        if torch.any(valid_lengths < required_tokens):
             raise ValueError(
-                "Some sequences are shorter than the configured action horizon. "
+                "Some sequences are shorter than the configured action token count. "
                 f"Minimum length in batch: {int(valid_lengths.min().item())}, "
-                f"required: {self.horizon}."
+                f"required: {required_tokens}."
             )
 
-        base_positions = valid_lengths - self.horizon
-        offsets = torch.arange(self.horizon, device=device).unsqueeze(0)
+        base_positions = valid_lengths - required_tokens
+        offsets = torch.arange(required_tokens, device=device).unsqueeze(0)
         gather_positions = base_positions.unsqueeze(1) + offsets
         gather_positions = gather_positions.clamp(min=0, max=seq_len - 1)
         gather_positions = gather_positions.unsqueeze(-1).expand(-1, -1, hidden_dim)
@@ -542,12 +604,30 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         return mask
 
     def _decode_action_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
-        batch_size, horizon, hidden_dim = embeddings.size()
-        reshaped = embeddings.reshape(batch_size * horizon, hidden_dim)
+        batch_size, token_count, hidden_dim = embeddings.size()
+        reshaped = embeddings.reshape(batch_size * token_count, hidden_dim)
 
         decoded = self.action_decoder(reshaped)
 
-        return decoded.reshape(batch_size, horizon, self._action_dim)
+        decoded = decoded.reshape(
+            batch_size,
+            token_count,
+            self._action_chunk_size,
+            self._action_dim,
+        )
+        actions = decoded.reshape(batch_size, token_count * self._action_chunk_size, self._action_dim)
+        if actions.size(1) > self.horizon:
+            actions = actions[:, : self.horizon, :]
+        return actions
+
+    def _sample_mon_action_embeddings(self, action_embeddings: torch.Tensor) -> torch.Tensor:
+        if not self._use_mon:
+            return action_embeddings.unsqueeze(0)
+        expanded_embeddings = action_embeddings.unsqueeze(0).expand(self._mon_num_samples, -1, -1, -1)
+        if self._mon_noise_std == 0:
+            return expanded_embeddings.clone()
+        noise = torch.randn_like(expanded_embeddings)
+        return expanded_embeddings + noise * self._mon_noise_std
 
     def _convert_actions_to_token_tensor(
         self,
@@ -579,9 +659,7 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         target_seq: torch.Tensor,
         loss_type: str,
         loss_horizon: Optional[int],
-        use_fde_loss: bool = False,
-        fde_loss_steps: Optional[Tuple[int, ...]] = None,
-    ) -> tuple[torch.Tensor, Optional[dict[str, Optional[torch.Tensor]]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         target_seq = target_seq.to(device=action_output.device)
         horizon, action_dim = self._infer_horizon_and_dim(action_output, target_seq)
         steps = horizon
@@ -592,29 +670,16 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
 
         if loss_type == "mse":
             preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
-            base_loss = F.mse_loss(preds_bf16, targets_bf16)
-            if not use_fde_loss:
-                return base_loss.to(dtype=action_output.dtype), None
-            fde_losses = self._compute_fde_loss(
-                action_output,
-                target_seq,
-                steps,
-                action_dim,
-                fde_loss_steps,
-            )
-            return base_loss.to(dtype=action_output.dtype), fde_losses
+            action_loss = F.mse_loss(preds_bf16, targets_bf16)
         elif loss_type == "l1":
-            if use_fde_loss:
-                raise ValueError("`use_fde_loss=True` requires `loss_type='mse'`.")
-            if not use_fde_loss:
-                preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
-                loss = torch.mean(torch.abs(preds_bf16 - targets_bf16))
-                return loss.to(dtype=action_output.dtype), None
+            preds_bf16, targets_bf16 = self._prepare_mse_tensors(action_output, target_seq, steps, action_dim)
+            action_loss = torch.mean(torch.abs(preds_bf16 - targets_bf16))
         elif loss_type == "ade":
-            loss = self._compute_ade_loss(action_output, target_seq, horizon, action_dim, steps)
-            return loss.to(dtype=action_output.dtype), None
+            action_loss = self._compute_ade_loss(action_output, target_seq, horizon, action_dim, steps)
         else:
             raise ValueError(f"Unsupported action loss type '{loss_type}'. Use 'l1', 'mse', or 'ade'.")
+        smoothness_loss = self._compute_smoothness_loss(action_output, action_dim, steps)
+        return action_loss.to(dtype=action_output.dtype), smoothness_loss.to(dtype=action_output.dtype)
 
     def _prepare_mse_tensors(
         self,
@@ -632,67 +697,6 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         targets_bf16 = torch.nan_to_num(target_sliced.to(dtype=torch.bfloat16), nan=0.0, posinf=1e6, neginf=-1e6)
         return pred_sliced, targets_bf16
 
-    def _compute_fde_loss(
-        self,
-        action_output: torch.Tensor,
-        target_seq: torch.Tensor,
-        steps: int,
-        action_dim: int,
-        fde_loss_steps: Optional[Tuple[int, ...]] = None,
-    ) -> tuple[torch.Tensor, dict[str, Optional[torch.Tensor]]]:
-        batch_size = action_output.size(0)
-        pred_sliced = action_output[:, : steps * action_dim]
-        pred_sliced = torch.nan_to_num(pred_sliced, nan=0.0, posinf=1e6, neginf=-1e6)
-        pred_deltas = pred_sliced.reshape(batch_size, steps, action_dim).to(dtype=torch.float32)
-        pred_deltas = torch.nan_to_num(pred_deltas, nan=0.0, posinf=1e6, neginf=-1e6)
-
-        if target_seq.dim() == 3:
-            target_deltas = target_seq[:, :steps, :]
-        else:
-            target_deltas = target_seq[:, : steps * action_dim].reshape(batch_size, steps, action_dim)
-        target_deltas = torch.nan_to_num(target_deltas.to(dtype=torch.float32), nan=0.0, posinf=1e6, neginf=-1e6)
-
-        pred_positions = torch.cumsum(pred_deltas, dim=1)
-        target_positions = torch.cumsum(target_deltas, dim=1)
-
-        eval_steps = (30, 50, 79)
-        if fde_loss_steps is None:
-            selected_steps = eval_steps
-        else:
-            selected_steps = tuple(int(step) for step in fde_loss_steps)
-
-        if any(step <= 0 for step in selected_steps):
-            raise ValueError("`fde_loss_steps` must contain positive integers.")
-        if any(step not in eval_steps for step in selected_steps):
-            raise ValueError("`fde_loss_steps` must be a subset of (30, 50, 79).")
-
-        seen = set()
-        deduped_selected = []
-        for step in selected_steps:
-            if step not in seen:
-                seen.add(step)
-                deduped_selected.append(step)
-        selected_steps = tuple(deduped_selected)
-
-        losses: dict[str, Optional[torch.Tensor]] = {f"step_{step}": None for step in eval_steps}
-        for step in eval_steps:
-            if steps < step:
-                continue
-            pred_step = pred_positions[:, step - 1, :]
-            target_step = target_positions[:, step - 1, :]
-            losses[f"step_{step}"] = F.mse_loss(pred_step, target_step)
-
-        available_steps = [step for step in selected_steps if step <= steps]
-        if not available_steps:
-            raise ValueError("`fde_loss_steps` must include at least one step within the loss horizon.")
-
-        output_dtype = action_output.dtype
-        for key, value in losses.items():
-            if value is not None:
-                losses[key] = value.to(dtype=output_dtype)
-
-        return losses
-
     def _compute_ade_loss(
         self,
         action_output: torch.Tensor,
@@ -708,9 +712,28 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         target_deltas = torch.nan_to_num(target_deltas.to(dtype=torch.float32), nan=0.0, posinf=1e6, neginf=-1e6)
 
         # distances = torch.linalg.norm(pred_deltas - target_deltas, dim=2)
-        distances = torch.sum((pred_deltas - target_deltas) ** 2, dim=2)
+        # distances = torch.sum((pred_deltas - target_deltas) ** 2, dim=2)
+        distances = torch.sqrt(((pred_deltas - target_deltas).cumsum(dim=1) ** 2).sum(dim=2))
+
 
         return distances.mean()
+
+    def _compute_smoothness_loss(
+        self,
+        action_output: torch.Tensor,
+        action_dim: int,
+        steps: int,
+    ) -> torch.Tensor:
+        if steps <= 1:
+            return torch.zeros((), device=action_output.device, dtype=torch.float32)
+
+        pred_deltas = action_output[:, : steps * action_dim].reshape(action_output.size(0), steps, action_dim)
+        pred_deltas = torch.nan_to_num(pred_deltas, nan=0.0, posinf=1e6, neginf=-1e6).float()
+
+        deltas = pred_deltas[:, 1:, :] - pred_deltas[:, :-1, :]
+        squared_l2 = torch.sum(deltas ** 2, dim=2)
+        per_sample = squared_l2.sum(dim=1) / (steps - 1)
+        return per_sample.mean()
 
     def _reshape_delta_sequence(self, sequence: torch.Tensor, horizon: int, action_dim: int) -> torch.Tensor:
         if sequence.dim() == 2:
@@ -869,7 +892,11 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
         return_generation_output: bool = False,
         **forward_kwargs,
     ):
-        """Autoregressively generate actions by decoding the action head one token at a time."""
+        """
+        Autoregressively generate actions by decoding the action head one token at a time.
+        When MoN is enabled, this returns a batched set of candidates with shape
+        (batch * mon_num_samples, horizon * action_dim).
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided to generate actions.")
         if tokenizer is None:
@@ -911,10 +938,23 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
                 hidden_state = hidden_state.unsqueeze(1)
             last_hidden = hidden_state[:, -1:, :]
 
-            decoded_action = self._decode_action_embeddings(last_hidden).squeeze(1)
+            if self._use_mon:
+                sampled_hidden = self._sample_mon_action_embeddings(last_hidden)
+                sample_count, batch_size, token_count, hidden_dim = sampled_hidden.size()
+                sampled_hidden = sampled_hidden.reshape(sample_count * batch_size, token_count, hidden_dim)
+                sampled_actions = self._decode_action_embeddings(sampled_hidden).squeeze(1)
+                sampled_actions = sampled_actions.reshape(sample_count, batch_size, self._action_dim)
+                collected_actions.append(sampled_actions)
 
-            collected_actions.append(decoded_action)
-            next_token_tensor = self._convert_actions_to_token_tensor(decoded_action, tokenizer, device=device)
+                # Keep language-model token rollout shape unchanged; use the first MoN sample
+                # to synthesize a token id for bookkeeping in generated_sequences.
+                action_for_token = sampled_actions[0]
+            else:
+                decoded_action = self._decode_action_embeddings(last_hidden).squeeze(1)
+                collected_actions.append(decoded_action)
+                action_for_token = decoded_action
+
+            next_token_tensor = self._convert_actions_to_token_tensor(action_for_token, tokenizer, device=device)
 
             generated_sequences = torch.cat([generated_sequences, next_token_tensor.unsqueeze(-1)], dim=1)
 
@@ -932,6 +972,17 @@ class LlamaForCausalLMWithActions(LlamaForCausalLM):
             next_input_ids = torch.multinomial(probabilities, num_samples=1)
 
             # next_input_ids = next_token_tensor.unsqueeze(-1)
+
+        if self._use_mon:
+            action_tensor = torch.stack(collected_actions, dim=2)  # (samples, batch, steps, action_dim)
+            flattened_actions = action_tensor.permute(1, 0, 2, 3).reshape(
+                generated_sequences.size(0) * self._mon_num_samples,
+                -1,
+            )
+            if return_generation_output:
+                expanded_sequences = generated_sequences.repeat_interleave(self._mon_num_samples, dim=0)
+                return flattened_actions, expanded_sequences
+            return flattened_actions
 
         action_tensor = torch.stack(collected_actions, dim=1)
         flattened_actions = action_tensor.reshape(action_tensor.size(0), -1)
