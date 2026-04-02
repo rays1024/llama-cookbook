@@ -18,6 +18,7 @@ from llama_cookbook.inference.model_utils import load_model, load_peft_model
 from llama_cookbook.utils.action_model import LlamaForCausalLMWithActions
 from llama_cookbook.utils.bidirection_attn_llama import LlamaForBidirectionAttn
 from llama_cookbook.utils.bidirection_action_model import LlamaForBidirectionAttnWithActions
+from llama_cookbook.utils.bidirection_diffusion_model import LlamaForBidirectionAttnWithDiffusionActions
 from transformers import AutoConfig
 
 from llama_cookbook.inference.safety_utils import AgentType, get_safety_checker
@@ -112,7 +113,7 @@ def main(
     model_name,
     peft_model: str = None,
     quantization: str = None, # Options: 4bit, 8bit
-    max_new_tokens: int = 820,  # The maximum numbers of tokens to generate
+    max_new_tokens: int = 80,  # The maximum numbers of tokens to generate
     prompt_file: str = None,
     seed: int = 42,  # seed value for reproducibility
     do_sample: bool = True,  # Whether or not to use sampling ; use greedy decoding otherwise.
@@ -300,16 +301,25 @@ def main(
     custom_tokens.extend([f"STRAIGHT_{i}" for i in range(30)])
 
     tokenizer.add_tokens(custom_tokens)
+    # goal_prediction_start_ids = tokenizer.encode("Future 30th step position:", add_special_tokens=False)  # GT CoT
+
+    # def find_subsequence_start(sequence, subsequence):  # GT CoT
+    #     if len(subsequence) == 0:  # GT CoT
+    #         return -1  # GT CoT
+    #     for idx in range(len(sequence) - len(subsequence) + 1):  # GT CoT
+    #         if sequence[idx:idx + len(subsequence)] == subsequence:  # GT CoT
+    #             return idx  # GT CoT
+    #     return -1  # GT CoT
 
     output_file = "inference_result.jsonl"
-    if os.path.exists(output_file):
+    if os.path.exists(output_file): # keep later
         os.remove(output_file)
     attention_file = "attention_result.jsonl"
     if os.path.exists(attention_file):
         os.remove(attention_file)
 
-    model = load_model(model_name, quantization, use_fast_kernels, **kwargs)
-    device = model.device
+    # model = load_model(model_name, quantization, use_fast_kernels, **kwargs)
+    # device = model.device
     
     # device = "cuda" if torch.cuda.is_available() else "cpu"
     # config = AutoConfig.from_pretrained(model_name)
@@ -317,10 +327,11 @@ def main(
     # model = LlamaForCausalLMWithActions.from_pretrained(model_name, config=config)
     # model.to(device)
 
-    # device = "cuda" if torch.cuda.is_available() else "xpu" if is_xpu_available() else "cpu"
-    # # model = LlamaForBidirectionAttn.from_pretrained(model_name)
+    device = "cuda" if torch.cuda.is_available() else "xpu" if is_xpu_available() else "cpu"
+    # model = LlamaForBidirectionAttn.from_pretrained(model_name)
     # model = LlamaForBidirectionAttnWithActions.from_pretrained(model_name)
-    # model.to(device)
+    model = LlamaForBidirectionAttnWithDiffusionActions.from_pretrained(model_name)
+    model.to(device)
     
     
     if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
@@ -358,8 +369,6 @@ def main(
             batch = {k: v.to("xpu") for k, v in batch.items()}
         else:
             batch = {k: v.to("cuda") for k, v in batch.items()}
-
-        breakpoint()
 
         with torch.no_grad():
             outputs = model.generate(
@@ -536,8 +545,9 @@ def main(
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_traj_prediction_5hz_all_vec_with_seq_norm_True.parquet"
 
     # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_prediction_10hz_all_vec_norm_True.parquet"
-    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_conditioned_traj_prediction_token_10hz_all_vec_norm_True.parquet"
-    data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_conditioned_traj_prediction_text_10hz_all_vec_norm_True.parquet"
+    data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_conditioned_traj_prediction_token_10hz_all_vec_norm_True.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_goal_conditioned_traj_prediction_text_10hz_all_vec_norm_True.parquet"
+    # data_path = "/p/ruishen/processed_waymo_data/validation/waymo_tokenized/trimmed_combined_cot_goal_prediction_10hz_all_vec_norm_True.parquet"
 
     # custom_dataset = datasets.Dataset.from_parquet(data_path)
 
@@ -576,6 +586,7 @@ def main(
     for i in tqdm(range(0, num_samples, batch_size), desc="Processing samples"):
         input_ids_batch = []
         attention_mask_batch = []
+        # labels_batch_gt_cot = []  # GT CoT
         ground_truths = []
         sid_batch = []
         ego_id_batch = []
@@ -589,6 +600,9 @@ def main(
 
         # if (sid != "e822a1b3522f2ce4" or int(ego_id) != 2277):
         #     continue
+
+        if (sid != "1e900bd57ddf0142" or int(ego_id) != 81):
+            continue
 
         # if sid != target_sid or int(ego_id) != target_ego_id:
         #     continue
@@ -719,6 +733,17 @@ def main(
             attention_mask_neg_100 = [attention_mask[i] for i in indices_neg_100]
 
             input_ids_greater_0 = [input_ids[i] for i in indices_greater_0]
+            # goal_start_idx = find_subsequence_start(input_ids_greater_0, goal_prediction_start_ids)  # GT CoT
+            # gt_cot_ids = []  # GT CoT
+            # goal_only_ids = input_ids_greater_0  # GT CoT
+            # if goal_start_idx > 0:  # GT CoT
+                # gt_cot_ids = input_ids_greater_0[:goal_start_idx]  # GT CoT
+                # goal_only_ids = input_ids_greater_0[goal_start_idx:]  # GT CoT
+            # if len(gt_cot_ids) > 0:  # GT CoT
+                # input_ids_neg_100 = input_ids_neg_100 + gt_cot_ids  # GT CoT
+                # attention_mask_neg_100 = attention_mask_neg_100 + [1] * len(gt_cot_ids)  # GT CoT
+            # labels_with_gt_cot = [-100] * len(input_ids_neg_100) + goal_only_ids  # GT CoT
+            # labels_batch_gt_cot.append(labels_with_gt_cot)  # GT CoT
 
             # ego_traj_start_input_id = tokenizer("EGO_TRAJ_START", return_tensors="pt").input_ids[0][-1].item()
 
@@ -734,6 +759,11 @@ def main(
             # attention_mask_neg_100.append(1)
 
             # Store the batch data
+
+            # temp = tokenizer.decode(input_ids_neg_100)
+            # temp = temp.replace("Future 30th step position: ###[26.591, 6.898]###, 50th step position: ###[35.595, 24.52]###, 80th step position: ###[37.626, 42.96]###.",
+            #                     "Future 30th step position: ###[25.000, 0.000]###, 50th step position: ###[40.000, 0.000]###, 80th step position: ###[70.000, 0.000]###.")
+            # input_ids_neg_100 = tokenizer(temp, add_special_tokens=False).input_ids
             input_ids_batch.append(input_ids_neg_100)
             attention_mask_batch.append(attention_mask_neg_100)
 
@@ -860,19 +890,37 @@ def main(
         # )
 
 
-        # input_ids_batch = random_rows['input_ids'][i:i+batch_size]
-        # attention_mask_batch = random_rows['attention_mask'][i:i+batch_size]
+        input_ids_batch = random_rows['input_ids'][i:i+batch_size] # parallel decoding with bidirectional attention
+        attention_mask_batch = random_rows['attention_mask'][i:i+batch_size] # parallel decoding with bidirectional attention
         labels_batch = random_rows['labels'][i:i+batch_size]
 
-        # input_ids_batch = torch.tensor(input_ids_batch, device=device)
-        # attention_mask_batch = torch.tensor(attention_mask_batch, device=device)
+        input_ids_batch = torch.tensor(input_ids_batch, device=device) # parallel decoding with bidirectional attention
+        attention_mask_batch = torch.tensor(attention_mask_batch, device=device) # parallel decoding with bidirectional attention
         labels_batch = torch.tensor(labels_batch, device=device)
 
-        # target_mask = labels_batch != -100
-        # masking_id = -1
-        # # mask input_ids where labels are -100
-        # input_ids_batch = torch.where(target_mask, masking_id, input_ids_batch)
-        # attention_mask_batch = torch.where(target_mask, 2, attention_mask_batch)
+        # parallel decoding with alternative goal
+        og_labels_batch = labels_batch[labels_batch != -100]
+        input_ids_context = input_ids_batch[labels_batch == -100]
+        temp = tokenizer.decode(input_ids_context.tolist(), skip_special_tokens=True)
+        temp = temp.replace("Future 30th step position: ###[26.591, 6.898]###, 50th step position: ###[35.595, 24.52]###, 80th step position: ###[37.626, 42.96]###.",
+                            "Future 30th step position: ###[20.000, -7.000]###, 50th step position: ###[25.000, -15.000]###, 80th step position: ###[26.000, -30.000]###.")
+        input_ids_context = tokenizer(temp, add_special_tokens=False).input_ids
+        input_ids_batch = torch.tensor([input_ids_context + [-1] * len(og_labels_batch)], device=device)
+        attention_mask_batch = torch.ones_like(input_ids_batch, device=device)
+        labels_batch = torch.tensor([[-100] * len(input_ids_context) + og_labels_batch.tolist()], device=device)
+
+
+        # if len(labels_batch_gt_cot) > 0:  # GT CoT
+        #     max_label_len = max(len(x) for x in labels_batch_gt_cot)  # GT CoT
+        #     labels_batch_gt_cot = [x + [-100] * (max_label_len - len(x)) for x in labels_batch_gt_cot]  # GT CoT
+        #     labels_batch = torch.tensor(labels_batch_gt_cot, device=device)  # GT CoT
+
+        # for parallel decoding with bidirectional attention
+        target_mask = labels_batch != -100
+        masking_id = -1
+        # mask input_ids where labels are -100
+        input_ids_batch = torch.where(target_mask, masking_id, input_ids_batch)
+        attention_mask_batch = torch.where(target_mask, 2, attention_mask_batch)
 
         # Create the batch dictionary
         batch = {
@@ -893,9 +941,6 @@ def main(
 
         num_return_sequences = 6
         inference(batch, temperature, top_p, top_k, max_new_tokens, num_return_sequences=num_return_sequences, **kwargs)
-
-        # if sid == target_sid and int(ego_id) == target_ego_id:
-        #     exit()
 
 
 if __name__ == "__main__":

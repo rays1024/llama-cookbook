@@ -336,7 +336,10 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 batch["input_ids"][mask_positions] = mask_id
 
                                 output = model(**batch, tokenizer=tokenizer, task='action')
-                                loss = output.action_loss
+                                action_loss = output.action_prediction_loss
+                                # ce_loss = output.cross_entropy_loss
+                                ce_loss = output.language_model_loss
+                                loss = action_loss + ce_loss
 
                             elif train_config.vec_emb_model:
                                 output = model(map_payloads=batch['map_payloads'],
@@ -475,10 +478,10 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             wandb_run.log({
                                 'train/action_loss': action_loss.detach().float(),
                                 'train/ce_loss': ce_loss.detach().float(),
-                                'train/vec_order_loss': vec_order_loss.detach().float(),
-                                'train/masking_prob': masking_prob,
+                                # 'train/vec_order_loss': vec_order_loss.detach().float(),
+                                # 'train/masking_prob': masking_prob,
                                 # 'train/ml_bce_loss': mlbce_loss.detach().float() if 'mlbce_loss' in locals() else 0.0,
-                                'train/smoothness_loss': smoothness_loss.detach().float() if smoothness_loss is not None else 0.0,
+                                # 'train/smoothness_loss': smoothness_loss.detach().float() if smoothness_loss is not None else 0.0,
                             })
                     pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
 
@@ -911,7 +914,10 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                         batch["input_ids"][mask_positions] = mask_id
 
                         output = model(**batch, tokenizer=tokenizer, task='action')
-                        loss = output.action_loss
+                        action_loss += output.action_prediction_loss
+                        # ce_loss += output.cross_entropy_loss
+                        ce_loss += output.language_model_loss
+                        loss = output.action_prediction_loss
 
                     elif train_config.vec_emb_model:
                         output = model(map_payloads=batch['map_payloads'],
@@ -971,32 +977,32 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
         if train_config.action_head and isinstance(action_loss, torch.Tensor):
             dist.all_reduce(action_loss, op=dist.ReduceOp.SUM)
             dist.all_reduce(ce_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(vec_order_loss, op=dist.ReduceOp.SUM)
+            # dist.all_reduce(vec_order_loss, op=dist.ReduceOp.SUM)
             # dist.all_reduce(mlbce_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(smoothness_loss, op=dist.ReduceOp.SUM)
+            # dist.all_reduce(smoothness_loss, op=dist.ReduceOp.SUM)
 
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / len(eval_dataloader)
     if train_config.action_head and isinstance(action_loss, torch.Tensor):
-        eval_ade = eval_ade / len(eval_dataloader)
-        eval_ce = eval_ce / len(eval_dataloader)
-        eval_aux_loss = eval_aux_loss / len(eval_dataloader)
+        # eval_ade = eval_ade / len(eval_dataloader)
+        # eval_ce = eval_ce / len(eval_dataloader)
+        # eval_aux_loss = eval_aux_loss / len(eval_dataloader)
         action_loss = action_loss / len(eval_dataloader)
         ce_loss = ce_loss / len(eval_dataloader)
-        vec_order_loss = vec_order_loss / len(eval_dataloader)
+        # vec_order_loss = vec_order_loss / len(eval_dataloader)
         # mlbce_loss = mlbce_loss / len(eval_dataloader)
-        smoothness_loss = smoothness_loss / len(eval_dataloader)
+        # smoothness_loss = smoothness_loss / len(eval_dataloader)
     if train_config.enable_fsdp:
         eval_epoch_loss = eval_epoch_loss/world_size
         if train_config.action_head and isinstance(action_loss, torch.Tensor):
-            eval_ade = eval_ade / world_size
-            eval_ce = eval_ce / world_size
-            eval_aux_loss = eval_aux_loss / world_size
+            # eval_ade = eval_ade / world_size
+            # eval_ce = eval_ce / world_size
+            # eval_aux_loss = eval_aux_loss / world_size
             action_loss = action_loss / world_size
             ce_loss = ce_loss / world_size
-            vec_order_loss = vec_order_loss / world_size
+            # vec_order_loss = vec_order_loss / world_size
             # mlbce_loss = mlbce_loss / world_size
-            smoothness_loss = smoothness_loss / world_size
+            # smoothness_loss = smoothness_loss / world_size
 
     if train_config.action_head and isinstance(action_loss, torch.Tensor):
         eval_ppl = torch.exp(ce_loss)
@@ -1038,9 +1044,9 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
             wandb_run.log({
                 'eval/action_loss': action_loss.detach().float() if isinstance(action_loss, torch.Tensor) else 0.0,
                 'eval/ce_loss': ce_loss.detach().float() if isinstance(ce_loss, torch.Tensor) else 0.0,
-                'eval/vec_order_loss': vec_order_loss.detach().float() if isinstance(vec_order_loss, torch.Tensor) else 0.0,
+                # 'eval/vec_order_loss': vec_order_loss.detach().float() if isinstance(vec_order_loss, torch.Tensor) else 0.0,
                 # 'eval/ml_bce_loss': mlbce_loss.detach().float() if 'mlbce_loss' in locals() else 0.0,
-                'eval/smoothness_loss': smoothness_loss.detach().float() if isinstance(smoothness_loss, torch.Tensor) else 0.0,
+                # 'eval/smoothness_loss': smoothness_loss.detach().float() if isinstance(smoothness_loss, torch.Tensor) else 0.0,
             }, commit=False)
 
     return eval_ppl, eval_epoch_loss, val_step_loss, val_step_perplexity

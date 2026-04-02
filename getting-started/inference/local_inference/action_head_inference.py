@@ -69,6 +69,45 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Maximum number of samples to process from the input Parquet file.",
     )
+    parser.add_argument(
+        "--decode_tokens",
+        action="store_true",
+        help="Decode diffusion output embeddings to token ids via lm_head and save text outputs.",
+    )
+    parser.add_argument(
+        "--decode_do_sample",
+        action="store_true",
+        help="Use sampling for token decoding (default is greedy decoding).",
+    )
+    parser.add_argument(
+        "--decode_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for decode-token sampling mode.",
+    )
+    parser.add_argument(
+        "--decode_top_p",
+        type=float,
+        default=1.0,
+        help="Top-p for decode-token sampling mode.",
+    )
+    parser.add_argument(
+        "--decode_top_k",
+        type=int,
+        default=0,
+        help="Top-k for decode-token sampling mode (0 disables top-k filtering).",
+    )
+    parser.add_argument(
+        "--decode_repetition_penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty for decode-token sampling mode.",
+    )
+    parser.add_argument(
+        "--debug_forward_last_step_loss",
+        action="store_true",
+        help="Temporary debug: run model.forward(task='action') at timestep t=0 and print diffusion loss.",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +130,129 @@ def trim_input_ids(input_ids, labels, attention_mask, keep_first_n=0):
     attention_mask = attention_mask[: label_indexes[0]]
     return input_ids, attention_mask
 
+
+def _decode_ground_truth_and_context(tokenizer, input_ids, labels):
+    if labels is None:
+        return None, tokenizer.decode(input_ids, skip_special_tokens=True)
+
+    target_ids = [int(tok) for tok in labels if tok != -100]
+    context_ids = [int(input_ids[i]) for i, tok in enumerate(labels) if tok == -100 and i < len(input_ids)]
+
+    ground_truth = tokenizer.decode(target_ids, skip_special_tokens=True) if len(target_ids) > 0 else ""
+    context = tokenizer.decode(context_ids, skip_special_tokens=True) if len(context_ids) > 0 else ""
+    return ground_truth, context
+
+
+def _print_debug_grad_summary(model, top_k: int = 12):
+    grad_items = []
+    total_sq = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grad_tensor = param.grad.detach().float()
+        param_tensor = param.detach().float()
+        grad_norm = float(grad_tensor.norm().item())
+        weight_mean = float(param_tensor.mean().item())
+        weight_abs_mean = float(param_tensor.abs().mean().item())
+        weight_norm = float(param_tensor.norm().item())
+        rel_grad_to_weight_norm = grad_norm / (weight_norm + 1e-12)
+        grad_items.append(
+            (
+                name,
+                grad_norm,
+                weight_mean,
+                weight_abs_mean,
+                weight_norm,
+                rel_grad_to_weight_norm,
+            )
+        )
+        total_sq += grad_norm * grad_norm
+
+    if len(grad_items) == 0:
+        print("[DEBUG][grad] No parameter gradients were produced.")
+        return
+
+    total_norm = total_sq ** 0.5
+    grad_items.sort(key=lambda x: x[1], reverse=True)
+    print(
+        "[DEBUG][grad] "
+        f"params_with_grad={len(grad_items)}, "
+        f"total_grad_norm={total_norm:.6e}"
+    )
+    for (
+        name,
+        grad_norm,
+        weight_mean,
+        weight_abs_mean,
+        weight_norm,
+        rel_grad_to_weight_norm,
+    ) in grad_items[:top_k]:
+        print(
+            "[DEBUG][grad] top_param "
+            f"name={name}, "
+            f"grad_norm={grad_norm:.6e}, "
+            f"weight_mean={weight_mean:.6e}, "
+            f"weight_abs_mean={weight_abs_mean:.6e}, "
+            f"weight_norm={weight_norm:.6e}, "
+            f"grad/weight_norm={rel_grad_to_weight_norm:.6e}"
+        )
+
+
+def _print_debug_embedding_stats(debug_outputs):
+    pred_embeds = getattr(debug_outputs, "predicted_x0", None)
+    gt_embeds = getattr(debug_outputs, "clean_actions", None)
+    if pred_embeds is None and isinstance(debug_outputs, dict):
+        pred_embeds = debug_outputs.get("predicted_x0", None)
+    if gt_embeds is None and isinstance(debug_outputs, dict):
+        gt_embeds = debug_outputs.get("clean_actions", None)
+
+    if pred_embeds is None:
+        print("[DEBUG][embed] No `predicted_x0` found in model outputs.")
+        return
+    if gt_embeds is None:
+        print("[DEBUG][embed] No `clean_actions` (GT embeddings) found in model outputs.")
+        return
+
+    pred_embeds = pred_embeds.detach().float()
+    gt_embeds = gt_embeds.detach().float()
+
+    print(
+        "[DEBUG][embed] "
+        f"pred_shape={tuple(pred_embeds.size())}, "
+        f"gt_shape={tuple(gt_embeds.size())}"
+    )
+
+    pred_mean = float(pred_embeds.mean().item())
+    pred_std = float(pred_embeds.std(unbiased=False).item())
+    gt_mean = float(gt_embeds.mean().item())
+    gt_std = float(gt_embeds.std(unbiased=False).item())
+
+    print(
+        "[DEBUG][embed] "
+        f"pred_mean={pred_mean:.8f}, pred_std={pred_std:.8f}, "
+        f"gt_mean={gt_mean:.8f}, gt_std={gt_std:.8f}"
+    )
+
+    if pred_embeds.size() != gt_embeds.size():
+        print("[DEBUG][embed] Pred/GT shape mismatch; skip direct diff metrics.")
+        return
+
+    diff = pred_embeds - gt_embeds
+    diff_mean = float(diff.mean().item())
+    diff_std = float(diff.std(unbiased=False).item())
+    mse = float(F.mse_loss(pred_embeds, gt_embeds).item())
+    mae = float(torch.mean(torch.abs(diff)).item())
+    flat_pred = pred_embeds.reshape(pred_embeds.size(0), -1)
+    flat_gt = gt_embeds.reshape(gt_embeds.size(0), -1)
+    cos = float(F.cosine_similarity(flat_pred, flat_gt, dim=-1).mean().item())
+
+    print(
+        "[DEBUG][embed] "
+        f"diff_mean={diff_mean:.8f}, diff_std={diff_std:.8f}, "
+        f"mse={mse:.8f}, mae={mae:.8f}, mean_cosine={cos:.8f}"
+    )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -100,8 +262,8 @@ def main() -> None:
     config.use_action_head = True
     # model = LlamaForCausalLMWithActions.from_pretrained(args.model_path, config=config)
     config.bidirectional_attention = True
-    model = LlamaForBidirectionAttnWithActions.from_pretrained(args.model_path, config=config)
-    # model = LlamaForBidirectionAttnWithDiffusionActions.from_pretrained(args.model_path, config=config)
+    # model = LlamaForBidirectionAttnWithActions.from_pretrained(args.model_path, config=config)
+    model = LlamaForBidirectionAttnWithDiffusionActions.from_pretrained(args.model_path, config=config)
 
     model.to(device)
     model.eval()
@@ -303,7 +465,8 @@ def main() -> None:
             row_attention_mask = row.get("attention_mask", None)
             # row_input_ids, row_attention_mask = trim_input_ids(row_input_ids, row_labels, row_attention_mask, keep_first_n=40)
             row_pred_seq = row.get("pred_seq", None)
-            row_pred_seq = np.stack(row_pred_seq)
+            if row_pred_seq is not None:
+                row_pred_seq = np.stack(row_pred_seq)
 
             row_sid = row.get("sid", None)
             row_ego_id = row.get("ego_id", None)
@@ -312,15 +475,61 @@ def main() -> None:
             #     continue
 
             input_ids = _to_tensor(row_input_ids, dtype=torch.long, device=device).unsqueeze(0)
+            original_input_ids = input_ids.clone()
             attention_mask = None
             if row_attention_mask is not None:
                 attention_mask = _to_tensor(row_attention_mask, dtype=torch.long, device=device).unsqueeze(0)
+            labels_tensor = _to_tensor(row_labels, dtype=torch.long, device=device).unsqueeze(0)
 
             pred_seq = None
             if row_pred_seq is not None:
                 pred_seq = _to_tensor(row_pred_seq, device=device).unsqueeze(0)
 
             with torch.no_grad():
+                if args.debug_forward_last_step_loss:
+                    debug_mask_type_labels = torch.where(
+                        labels_tensor == -100,
+                        torch.tensor(1, dtype=labels_tensor.dtype, device=labels_tensor.device),
+                        torch.tensor(2, dtype=labels_tensor.dtype, device=labels_tensor.device),
+                    )
+                    debug_input_ids = input_ids.clone()
+                    debug_input_ids = torch.where(
+                        debug_mask_type_labels == 2,
+                        torch.full_like(debug_input_ids, -1),
+                        debug_input_ids,
+                    )
+                    debug_timesteps = torch.zeros(
+                        (debug_input_ids.size(0),),
+                        dtype=torch.long,
+                        device=debug_input_ids.device,
+                    )
+                    model.zero_grad(set_to_none=True)
+                    with torch.enable_grad():
+                        debug_outputs = model(
+                            input_ids=debug_input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels_tensor,
+                            mask_type_labels=debug_mask_type_labels,
+                            task="action",
+                            timesteps=debug_timesteps,
+                            debug_print_loss=True,
+                            return_dict=True,
+                        )
+                        _print_debug_embedding_stats(debug_outputs)
+                        debug_loss = getattr(debug_outputs, "action_loss", None)
+                        if debug_loss is None:
+                            debug_loss = getattr(debug_outputs, "loss", None)
+                        if debug_loss is None:
+                            print("[DEBUG][grad] No loss returned from debug forward; skipping backward.")
+                        else:
+                            debug_loss.backward()
+                            print(
+                                "[DEBUG][grad] "
+                                f"backward_done loss={float(debug_loss.detach().float().item()):.8f}"
+                            )
+                            _print_debug_grad_summary(model)
+                    model.zero_grad(set_to_none=True)
+
                 if getattr(model, "_use_mon", False):
                     mask_type_labels = row_labels.copy()
                     mask_type_labels = _to_tensor(mask_type_labels, dtype=torch.long, device=device).unsqueeze(0)
@@ -330,7 +539,7 @@ def main() -> None:
                     mask_id = -1
                     mon_input_ids = torch.where(target_mask == 1, mask_id, input_ids)
 
-                    mon_action_output, _ = model.action_head_based_generate_actions(
+                    mon_action_output, generation_output = model.action_head_based_generate_actions(
                         input_ids=mon_input_ids,
                         attention_mask=attention_mask,
                         return_generation_output=True,
@@ -341,20 +550,46 @@ def main() -> None:
                         tokenizer=tokenizer,
                         max_new_tokens=args.max_new_tokens,
                         mask_type_labels=mask_type_labels,
+                        decode_tokens=args.decode_tokens,
+                        decode_do_sample=args.decode_do_sample,
+                        decode_temperature=args.decode_temperature,
+                        decode_top_p=args.decode_top_p,
+                        decode_top_k=args.decode_top_k,
+                        decode_repetition_penalty=args.decode_repetition_penalty,
                     )
 
                     mon_action_output = mon_action_output.detach().cpu()
-                    mon_action_batch = mon_action_output.reshape(mon_action_output.size(0), -1, 2).numpy()
-                    for mon_candidate_idx, mon_candidate in enumerate(mon_action_batch):
-                        json_line = {
-                            "ground_truth": row_pred_seq.tolist() if row_pred_seq is not None else None,
-                            "llm_answer": mon_candidate.tolist(),
-                            "mon_candidate_idx": mon_candidate_idx,
-                            "sid": row_sid,
-                            "ego_id": row_ego_id,
-                            "decoded_text": None,
-                        }
-                        f.write(json.dumps(json_line) + "\n")
+                    if args.decode_tokens:
+                        token_batches = mon_action_output.tolist()
+                        gt_text, context_text = _decode_ground_truth_and_context(
+                            tokenizer,
+                            row_input_ids,
+                            row_labels,
+                        )
+                        for mon_candidate_idx, token_ids in enumerate(token_batches):
+                            decoded_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+                            json_line = {
+                                "ground_truth": gt_text,
+                                "context": context_text,
+                                "llm_answer": decoded_text,
+                                "sid": row_sid,
+                                "agent_id": row_ego_id,
+                                "mon_candidate_idx": mon_candidate_idx,
+                                "llm_answer_token_ids": token_ids,
+                            }
+                            f.write(json.dumps(json_line) + "\n")
+                    else:
+                        mon_action_batch = mon_action_output.reshape(mon_action_output.size(0), -1, 2).numpy()
+                        for mon_candidate_idx, mon_candidate in enumerate(mon_action_batch):
+                            json_line = {
+                                "ground_truth": row_pred_seq.tolist() if row_pred_seq is not None else None,
+                                "llm_answer": mon_candidate.tolist(),
+                                "mon_candidate_idx": mon_candidate_idx,
+                                "sid": row_sid,
+                                "ego_id": row_ego_id,
+                                "decoded_text": None,
+                            }
+                            f.write(json.dumps(json_line) + "\n")
                     continue
 
                 for _ in range(args.num_runs):
@@ -387,10 +622,10 @@ def main() -> None:
 
                     target_mask = (mask_type_labels == 2).long()
                     mask_id = -1
-                    input_ids = torch.where(target_mask == 1, mask_id, input_ids)
+                    masked_input_ids = torch.where(target_mask == 1, mask_id, input_ids)
 
                     action_output, generation_output = model.action_head_based_generate_actions(
-                        input_ids=input_ids,
+                        input_ids=masked_input_ids,
                         attention_mask=attention_mask,
                         return_generation_output=True,
                         pad_token_id=tokenizer.pad_token_id,
@@ -400,6 +635,12 @@ def main() -> None:
                         tokenizer=tokenizer,
                         max_new_tokens=args.max_new_tokens,
                         mask_type_labels=mask_type_labels,
+                        decode_tokens=args.decode_tokens,
+                        decode_do_sample=args.decode_do_sample,
+                        decode_temperature=args.decode_temperature,
+                        decode_top_p=args.decode_top_p,
+                        decode_top_k=args.decode_top_k,
+                        decode_repetition_penalty=args.decode_repetition_penalty,
                     )
 
                     # generation_output = model.generate(
@@ -414,7 +655,7 @@ def main() -> None:
 
                     action_output_flat = action_output
                     action_loss = None
-                    if pred_seq is not None:
+                    if pred_seq is not None and not args.decode_tokens:
                         action_output_flat = action_output_flat.reshape(-1, 2).detach().cpu().numpy()
                         llm = np.cumsum(action_output_flat, axis=0)
                         gt = pred_seq.squeeze(0).detach().cpu().numpy()
@@ -423,19 +664,35 @@ def main() -> None:
                         action_loss = float(ade)
 
                     decoded_text = None
-                    # if tokenizer is not None and args.max_new_tokens > 0:
-                    #     generated_ids = generation_output.sequences
-                    #     # decoded_text = tokenizer.decode(generated_ids[0][len(input_ids[0]):], skip_special_tokens=True)
-                    #     decoded_text = tokenizer.decode(generated_ids[0][(mask_type_labels == -100).sum():], skip_special_tokens=True)
-
-                    json_line = {
-                        "ground_truth": row_pred_seq.tolist() if row_pred_seq is not None else None,
-                        "llm_answer": action_output_flat.tolist(),
-                        "action_loss": action_loss,
-                        "sid": row_sid,
-                        "ego_id": row_ego_id,
-                        "decoded_text": decoded_text,
-                    }
+                    if args.decode_tokens:
+                        token_ids = action_output.squeeze(0).detach().cpu().tolist()
+                        decoded_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+                        gt_text, context_text = _decode_ground_truth_and_context(
+                            tokenizer,
+                            original_input_ids.squeeze(0).detach().cpu().tolist(),
+                            row_labels,
+                        )
+                        json_line = {
+                            "ground_truth": gt_text,
+                            "context": context_text,
+                            "llm_answer": decoded_text,
+                            "sid": row_sid,
+                            "agent_id": row_ego_id,
+                            "llm_answer_token_ids": token_ids,
+                        }
+                    else:
+                        # if tokenizer is not None and args.max_new_tokens > 0:
+                        #     generated_ids = generation_output.sequences
+                        #     # decoded_text = tokenizer.decode(generated_ids[0][len(input_ids[0]):], skip_special_tokens=True)
+                        #     decoded_text = tokenizer.decode(generated_ids[0][(mask_type_labels == -100).sum():], skip_special_tokens=True)
+                        json_line = {
+                            "ground_truth": row_pred_seq.tolist() if row_pred_seq is not None else None,
+                            "llm_answer": action_output_flat.tolist(),
+                            "action_loss": action_loss,
+                            "sid": row_sid,
+                            "ego_id": row_ego_id,
+                            "decoded_text": decoded_text,
+                        }
                     f.write(json.dumps(json_line) + "\n")
 
     print(f"Saved inference results to {output_path.resolve()}")
